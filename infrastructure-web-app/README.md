@@ -22,8 +22,18 @@ This project showcases:
 │  │          │    │          │    │          │         │
 │  │ t3.micro │───▶│t3.small  │───▶│t3.medium │         │
 │  │ 1-2 inst │    │ 1-3 inst │    │ 2-5 inst │         │
+│  │ db.t3.micro│  │db.t3.small│   │db.t3.medium│        │
 │  └──────────┘    └──────────┘    └──────────┘         │
 │                                                          │
+│  Components:                                             │
+│  • VPC with public/private/database subnets             │
+│  • RDS PostgreSQL (private subnets)                     │
+│  • Auto Scaling Group (EC2 instances)                   │
+│  • Application Load Balancer (HTTPS)                    │
+│  • Route53 DNS (workspace-specific domains)             │
+│  • Secrets Manager (auto-synced passwords)              │
+│  • S3 bucket (application assets)                       │
+│  • AWS Systems Manager (secure access)                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -35,15 +45,28 @@ infrastructure-web-app/
 │   ├── workspaces.tf          # Workspace configurations
 │   ├── module.tf              # RDS and VPC modules
 │   ├── autoscaling.tf         # EC2 Auto Scaling Group
-│   ├── secret_manager.tf      # AWS Secrets Manager
+│   ├── loadbalancer.tf        # Application Load Balancer
+│   ├── secret_manager.tf      # AWS Secrets Manager (Terraform-native password sync)
+│   ├── route53.tf             # DNS configuration
+│   ├── ssl_cert.tf            # SSL certificates
+│   ├── s3.tf                  # S3 bucket
+│   ├── ssm.tf                 # Systems Manager
+│   ├── sg.tf                  # Security groups
 │   ├── variables.tf           # Input variables
-│   ├── outputs.tf             # Output values
-│   └── scripts/               # Bootstrap scripts
-├── sync-db-password.sh        # Password synchronization
-├── setup-workspaces.sh        # Workspace setup script
+│   ├── output.tf              # Output values
+│   ├── ami.tf                 # AMI data source
+│   ├── provider.tf            # Provider configuration
+│   ├── policy_role.tf         # IAM roles and policies
+│   ├── locals.tf              # Local values
+│   └── scripts/               # Bootstrap and userdata scripts
+├── sync-db-password.sh        # Manual password sync (optional fallback)
+├── setup-workspaces.sh        # Workspace setup automation
+├── compare-workspaces.sh      # Workspace comparison tool
+├── README.md                  # This file
 ├── WORKSPACE_SETUP.md         # Complete workspace guide
 ├── PROMOTION_CHECKLIST.md     # Deployment checklist
-└── DEPLOYMENT_WORKFLOW.md     # Workflow documentation
+├── DEPLOYMENT_WORKFLOW.md     # Workflow documentation
+└── PASSWORD_SYNC_TERRAFORM_NATIVE.md  # Password sync documentation
 ```
 
 ## 🚀 Quick Start
@@ -144,10 +167,12 @@ This project demonstrates:
 ## 💡 Key Features
 
 - **Multi-environment support** with workspace isolation
-- **Automated password sync** for RDS credentials
+- **Automated password sync** for RDS credentials (Terraform-native, no external scripts)
 - **Environment-specific configurations** for resource sizing
 - **Production safety** with deletion protection
+- **Workspace-specific DNS** (dev.example.com, staging.example.com, prod.example.com)
 - **Complete documentation** for team collaboration
+- **Secure access** via AWS Systems Manager (no SSH keys needed)
 
 ## 📋 Usage Examples
 
@@ -177,11 +202,15 @@ git push
 
 ### Password Sync
 
-If database password sync is needed:
+Password synchronization is now handled automatically by Terraform using a data source. The password is synced from the RDS-managed secret during `terraform apply`.
+
+If manual sync is needed (e.g., after manual password rotation):
 
 ```bash
 ./sync-db-password.sh
 ```
+
+See [PASSWORD_SYNC_TERRAFORM_NATIVE.md](PASSWORD_SYNC_TERRAFORM_NATIVE.md) for details.
 
 ### State Management
 

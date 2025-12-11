@@ -457,7 +457,7 @@ terraform state list  # Each workspace has separate state
 - ✅ **Infrastructure as Code**: Shows Terraform expertise with real-world patterns
 - ✅ **GitOps**: Integration of infrastructure changes with version control
 - ✅ **Best Practices**: Deletion protection, appropriate resource sizing, security
-- ✅ **Automation**: Password sync, workspace management, deployment workflows
+- ✅ **Automation**: Terraform-native password sync, workspace management, deployment workflows
 
 ---
 
@@ -523,11 +523,26 @@ terraform workspace select <workspace-name>
 
 #### Issue: Password Sync Issues
 
+Password sync is now handled automatically by Terraform using a data source. The password is synced from the RDS-managed secret during `terraform apply`.
+
+**If manual sync is needed:**
 ```bash
 # Run sync script (works with any workspace)
 cd ..
 ./sync-db-password.sh
 ```
+
+**Check if password is synced:**
+```bash
+# Verify secret has correct password
+aws secretsmanager get-secret-value \
+  --secret-id web-app-<workspace>-db-credential \
+  --region us-east-1
+```
+
+**For more details, see:**
+- [PASSWORD_SYNC_TERRAFORM_NATIVE.md](PASSWORD_SYNC_TERRAFORM_NATIVE.md) - Complete password sync documentation
+- [DEPLOYMENT_WORKFLOW.md](DEPLOYMENT_WORKFLOW.md) - Deployment workflow details
 
 #### Issue: Resources Created in Wrong Workspace
 

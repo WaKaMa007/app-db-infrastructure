@@ -6,11 +6,25 @@ This directory contains the Terraform configuration for the infrastructure.
 
 ```
 terraform/
-├── *.tf              # Main Terraform configuration files
-├── modules/          # Reusable Terraform modules
-│   ├── providers/
+├── workspaces.tf          # Workspace-specific configurations
+├── module.tf              # RDS and VPC module definitions
+├── autoscaling.tf         # EC2 Auto Scaling Group configuration
+├── loadbalancer.tf        # Application Load Balancer
+├── secret_manager.tf      # AWS Secrets Manager (Terraform-native password sync)
+├── route53.tf             # Route53 DNS records
+├── ssl_cert.tf            # ACM SSL certificates
+├── s3.tf                  # S3 bucket for application assets
+├── ssm.tf                 # AWS Systems Manager configuration
+├── sg.tf                  # Security groups
+├── variables.tf           # Input variables
+├── output.tf              # Output values
+├── ami.tf                 # AMI data source
+├── provider.tf            # AWS provider configuration
+├── policy_role.tf         # IAM roles and policies
+├── locals.tf              # Local computed values
+├── modules/               # Reusable Terraform modules
 │   └── s3-tfstate-backend/
-└── scripts/          # Helper scripts (userdata, bootstrap, etc.)
+└── scripts/               # Helper scripts (userdata, bootstrap, etc.)
 ```
 
 ## Usage

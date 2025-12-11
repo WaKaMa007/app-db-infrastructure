@@ -17,31 +17,43 @@
 3. **Password rotation** - If AWS rotates the RDS-managed password (rare, usually manual)
 4. **After RDS restore** - If you restore from a snapshot, password might change
 
-## Automated Solution (Recommended)
+## Automated Solution (Terraform-Native)
 
-I've updated your Terraform configuration to **automatically sync the password** after RDS is created/updated. The `null_resource.sync_db_password` will:
+The Terraform configuration now uses a **data source** to automatically read the RDS-managed password during `terraform apply`. This is more reliable than external scripts and works for all workspaces:
 
-- Run automatically after `terraform apply`
-- Only trigger when RDS instance changes
-- Update the secret silently (non-interactive mode)
-- Continue even if sync fails (password might already be correct)
+- ✅ Runs automatically during every `terraform apply`
+- ✅ Works for all workspaces (dev, staging, prod)
+- ✅ Part of Terraform lifecycle (visible in plan output)
+- ✅ No external scripts required
+- ✅ Resolves password sync during database creation
 
 ### How It Works
 
 ```hcl
-resource "null_resource" "sync_db_password" {
-  triggers = {
-    db_instance_id     = module.database.db_instance_identifier
-    db_instance_status = module.database.db_instance_status
-    # ... other triggers
-  }
+# Data source reads RDS-managed secret
+data "aws_secretsmanager_secret_version" "rds_managed_secret" {
+  count = length(try(module.database.db_instance_master_user_secret_arn, "")) > 0 ? 1 : 0
+  secret_id = module.database.db_instance_master_user_secret_arn
+  depends_on = [module.database]
+}
 
-  provisioner "local-exec" {
-    command = "./sync-db-password.sh --auto"
-    # Runs automatically after RDS is ready
-  }
+# Extract password from RDS secret
+locals {
+  db_password = length(data.aws_secretsmanager_secret_version.rds_managed_secret) > 0 ? (
+    jsondecode(data.aws_secretsmanager_secret_version.rds_managed_secret[0].secret_string)["password"]
+  ) : var.db_password
+}
+
+# Secret version uses the RDS-managed password automatically
+resource "aws_secretsmanager_secret_version" "db_credential" {
+  secret_string = jsonencode({
+    password = local.db_password  # Automatically from RDS!
+    # ... other fields
+  })
 }
 ```
+
+See [PASSWORD_SYNC_TERRAFORM_NATIVE.md](PASSWORD_SYNC_TERRAFORM_NATIVE.md) for complete details.
 
 ## Manual Sync (If Needed)
 
@@ -111,13 +123,21 @@ terraform apply
 
 ## Summary
 
-- **Automated**: Terraform now syncs passwords automatically ✅
-- **One-time per workspace**: Only needed when creating new RDS instances
-- **No manual steps**: Regular deployments don't require sync
-- **Fallback available**: Manual sync script if automation fails
+- **Automated**: Password sync happens automatically during `terraform apply` ✅
+- **Terraform-native**: Uses data source, no external scripts needed
+- **Works for all workspaces**: dev, staging, and prod
+- **During creation**: Password is synced when database is created, not after
+- **Fallback available**: Manual sync script (`sync-db-password.sh`) if needed
 
-You should **NOT** need to run the sync script manually for regular deployments. It's only needed:
-- When setting up a new workspace/environment
-- If the automatic sync fails (rare)
-- If RDS password is manually rotated
+You should **NOT** need to run the sync script manually. The password is automatically synced:
+- ✅ During initial database creation
+- ✅ On every `terraform apply` (if RDS-managed secret exists)
+- ✅ Works for all workspaces automatically
+
+Manual sync script is only needed for:
+- Troubleshooting password issues
+- After manual password rotation
+- If Terraform data source fails (rare)
+
+See [PASSWORD_SYNC_TERRAFORM_NATIVE.md](PASSWORD_SYNC_TERRAFORM_NATIVE.md) for complete documentation.
 

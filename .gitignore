@@ -82,3 +82,4 @@ DELETE_THESE_FILES.sh
 
 # Documentation archives (move troubleshooting docs here if keeping)
 docs/archive/
+.README.md.backup

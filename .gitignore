@@ -1,0 +1,84 @@
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Workspace state files (keep these in remote backend, not git)
+.terraform.tfstate.d/
+terraform.tfstate.d/
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files, which are likely to contain sensitive data
+*.tfvars
+*.tfvars.json
+
+# Ignore override files as they are usually used to override resources locally
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
+
+# Ignore lock file (uncomment if you want to ignore)
+# .terraform.lock.hcl
+
+# Temporary files
+*.tfplan
+*.tfplan.json
+
+# Lambda package files
+lambda-package/
+lambda-package.zip
+*.zip
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment files
+.env
+.env.local
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary response files
+*-response.json
+lambda-test*.json
+
+# Rendered userdata files
+.rendered_userdata.sh
+
+# Logs
+*.log
+
+# Test files
+userdata_apache_test.sh
+userdata.sh  # Old version
+
+# Temporary scripts
+check-mysql-users.sh
+db_init_manual.sh
+cleanup.sh
+DELETE_THESE_FILES.sh
+
+# Documentation archives (move troubleshooting docs here if keeping)
+docs/archive/

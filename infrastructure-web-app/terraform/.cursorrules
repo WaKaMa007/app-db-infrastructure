@@ -1,0 +1,122 @@
+# .cursorrules
+version: 1
+
+rules:
+  # Terraform Rules
+  - id: naming-conventions
+    description: "Ensure consistent, valid resource naming"
+    patterns:
+      - "^[a-z0-9-]{1,32}$"
+    guidance:
+      - "Use lowercase letters and hyphens only"
+      - "Keep names ≤ 32 characters (AWS limit for ALB/Target Groups)"
+      - "Pattern: <org>-<app>-<env>-<component>-<region>[-<seq>]"
+      - "Abbreviate long values (e.g., use1 for us-east-1)"
+    autofix:
+      - "Truncate names >32 chars and append random suffix"
+      - "Replace underscores with hyphens"
+      - "Convert camelCase to lowercase-hyphen format"
+
+  - id: resource-syntax
+    description: "Validate Terraform resource syntax"
+    guidance:
+      - "Always include required blocks (e.g., default_action in aws_lb_listener)"
+      - "Use tags for descriptions instead of unsupported arguments"
+      - "Place ingress/egress rules inside security groups, not aws_lb"
+      - "Reference resources correctly when using for_each (aws_resource[each.key])"
+    autofix:
+      - "Insert default_action block with forward to target group if missing"
+      - "Move ingress/egress blocks into aws_security_group"
+      - "Replace description argument with tags"
+
+  - id: certificates-dns
+    description: "Enforce ACM and Route53 DNS rules"
+    guidance:
+      - "Wildcards only allowed at leftmost label (*.example.com)"
+      - "Hosted zone names must be base domains (example.com), not wildcards"
+      - "Use Route53 DNS validation for ACM certificates"
+    autofix:
+      - "Replace *subdomain.example.com with *.example.com"
+      - "Strip wildcard from hosted_zone_name"
+      - "Generate DNS validation records automatically from ACM domain_validation_options"
+
+  - id: security-secrets
+    description: "Secure handling of secrets"
+    guidance:
+      - "Never hardcode passwords in Terraform or user data"
+      - "Use AWS Secrets Manager for DB credentials"
+      - "Attach IAM roles with least privilege (secretsmanager:GetSecretValue)"
+    autofix:
+      - "Replace plaintext password with aws_secretsmanager_secret resource"
+      - "Attach IAM role with secretsmanager:GetSecretValue permission"
+      - "Inject secrets via environment variables instead of inline"
+
+  - id: user-data
+    description: "Best practices for EC2 user data"
+    guidance:
+      - "Use user data only for bootstrapping (install packages, clone repo, start app)"
+      - "Keep app source code in Git or artifact storage, not inline"
+      - "Inject secrets via environment variables or AWS SDK calls"
+    autofix:
+      - "Remove inline app code from user data"
+      - "Insert git clone + pip install commands"
+      - "Add export statements for environment variables"
+
+  - id: outputs-dependencies
+    description: "Outputs and resource dependencies"
+    guidance:
+      - "Use depends_on when resource creation order matters"
+      - "Use for_each or count for scalable resources"
+      - "Keep outputs clean and reference correct indices"
+    autofix:
+      - "Add depends_on for ASG referencing target group"
+      - "Replace direct resource references with for_each indexing"
+      - "Simplify outputs to use aws_lb.dns_name or aws_route53_record[each.key].name"
+
+  # Kubernetes Rules
+  - id: k8s-naming
+    description: "Kubernetes resource naming conventions"
+    guidance:
+      - "Use lowercase, hyphen-separated names"
+      - "Keep names ≤ 63 characters (Kubernetes DNS label limit)"
+      - "Avoid uppercase and special characters"
+    autofix:
+      - "Convert names to lowercase"
+      - "Replace underscores with hyphens"
+      - "Truncate names >63 chars"
+
+  - id: k8s-best-practices
+    description: "Kubernetes manifest best practices"
+    guidance:
+      - "Always specify resource requests and limits"
+      - "Use ConfigMaps and Secrets for configuration"
+      - "Avoid hardcoding credentials in manifests"
+      - "Use labels and selectors consistently"
+    autofix:
+      - "Insert resource requests/limits if missing"
+      - "Move inline configs into ConfigMaps"
+      - "Replace plaintext secrets with Secret references"
+
+  # CI/CD Rules
+  - id: cicd-pipelines
+    description: "CI/CD pipeline best practices"
+    guidance:
+      - "Use environment-specific variables"
+      - "Keep secrets in vaults or encrypted stores"
+      - "Lint and test before deploy"
+      - "Use caching for dependencies"
+    autofix:
+      - "Insert lint/test stages if missing"
+      - "Replace plaintext secrets with vault references"
+      - "Add caching directives for common package managers"
+
+  - id: cicd-security
+    description: "CI/CD security practices"
+    guidance:
+      - "Run builds in isolated containers"
+      - "Use least privilege for pipeline service accounts"
+      - "Scan images for vulnerabilities"
+    autofix:
+      - "Add container isolation directives"
+      - "Restrict service account permissions"
+      - "Insert image scanning stage"

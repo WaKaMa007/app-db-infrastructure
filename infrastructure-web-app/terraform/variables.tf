@@ -124,7 +124,7 @@ variable "s3_bucket_name" {
 variable "hosted_zone_name" {
   description = "Name of the hosted zone"
   type        = string
-  default     = "555458746908.realhandsonlabs.net"
+  default     = "226839593180.realhandsonlabs.net"
 }
 
 variable "db_username" {

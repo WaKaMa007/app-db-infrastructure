@@ -130,11 +130,82 @@ variable "hosted_zone_name" {
 variable "db_username" {
   description = "Username for the database"
   type        = string
-  default     = "dbadmin"
+  # No default - must be provided via terraform.tfvars or -var flag
+  # Example: db_username = "dbadmin"
+  sensitive = false
 }
 
 variable "db_password" {
-  description = "Password for the database"
+  description = "Password for the database (use terraform.tfvars or environment variable, never commit to git)"
   type        = string
-  default     = "password"
+  # No default - must be provided via terraform.tfvars (gitignored) or -var flag
+  # Example: db_password = "your-secure-password-here"
+  sensitive = true # Marks as sensitive to prevent output in logs
+}
+
+# ============================================================================
+# CloudWatch Alarms Configuration
+# ============================================================================
+
+variable "alarm_email" {
+  description = "Email address to receive CloudWatch alarm notifications (leave empty to disable notifications)"
+  type        = string
+  default     = ""
+}
+
+# EC2 Alarm Thresholds
+variable "alarm_cpu_threshold" {
+  description = "Threshold for EC2 CPU utilization alarm (percentage)"
+  type        = number
+  default     = 80
+}
+
+variable "alarm_cpu_low_threshold" {
+  description = "Threshold for EC2 low CPU utilization alarm (percentage, for cost optimization)"
+  type        = number
+  default     = 10
+}
+
+# RDS Alarm Thresholds
+variable "alarm_rds_cpu_threshold" {
+  description = "Threshold for RDS CPU utilization alarm (percentage)"
+  type        = number
+  default     = 80
+}
+
+variable "alarm_rds_connections_threshold" {
+  description = "Threshold for RDS database connections alarm"
+  type        = number
+  default     = 80 # Adjust based on your db instance type and max_connections
+}
+
+variable "alarm_rds_free_storage_threshold" {
+  description = "Threshold for RDS free storage alarm (bytes, e.g., 10737418240 = 10 GB)"
+  type        = number
+  default     = 10737418240 # 10 GB
+}
+
+variable "alarm_rds_memory_threshold" {
+  description = "Threshold for RDS freeable memory alarm (bytes, alerts when below this)"
+  type        = number
+  default     = 268435456 # 256 MB (adjust based on your instance type)
+}
+
+# ALB Alarm Thresholds
+variable "alarm_alb_5xx_threshold" {
+  description = "Threshold for ALB HTTP 5xx errors alarm (count)"
+  type        = number
+  default     = 10 # Alert if 10+ 5xx errors in 5 minutes
+}
+
+variable "alarm_alb_4xx_threshold" {
+  description = "Threshold for ALB HTTP 4xx errors alarm (count)"
+  type        = number
+  default     = 100 # Alert if 100+ 4xx errors in 5 minutes
+}
+
+variable "alarm_alb_response_time_threshold" {
+  description = "Threshold for ALB target response time alarm (seconds)"
+  type        = number
+  default     = 2.0 # Alert if average response time > 2 seconds
 }

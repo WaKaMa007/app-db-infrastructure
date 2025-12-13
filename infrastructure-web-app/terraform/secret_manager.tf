@@ -18,44 +18,68 @@ resource "aws_secretsmanager_secret" "db_credential" {
   }
 }
 
-# Local values for database credentials
-# We use var.db_password and var.db_username directly to avoid count argument issues
-# RDS manages its own secret separately when manage_master_user_password = true
-# Our custom secret uses the password we provide, which matches what RDS uses initially
-locals {
-  db_password = var.db_password
-  db_username = var.db_username
-}
-
-# Secret version with actual credentials
-# Uses var.db_password which matches the password provided to RDS
-# RDS also manages its own secret separately (when manage_master_user_password = true)
-# Both secrets will have the same password since RDS uses the password we provide initially
+# Initial secret version with placeholder credentials
+# This will be automatically updated by the sync resource below
 resource "aws_secretsmanager_secret_version" "db_credential" {
   secret_id = aws_secretsmanager_secret.db_credential.id
 
-  # Store RDS credentials as JSON
-  # Password matches var.db_password which is what RDS uses
+  # Initial placeholder - will be synced automatically from RDS-managed secret
   secret_string = jsonencode({
-    username = local.db_username                   # From var.db_username
-    password = local.db_password                   # From var.db_password (matches RDS)
-    engine   = var.db_engine                       # Database engine (postgres)
-    host     = module.database.db_instance_address # RDS instance address (hostname)
-    port     = module.database.db_instance_port    # RDS instance port (from module output)
-    dbname   = var.db_name                         # Database name
+    username = var.db_username
+    password = var.db_password # Placeholder - will be updated automatically
+    engine   = var.db_engine
+    host     = module.database.db_instance_address
+    port     = module.database.db_instance_port
+    dbname   = var.db_name
   })
 
-  # Ensure RDS database is created before secret version
-  # The secret needs the RDS endpoint which is only available after the database is created
   depends_on = [
     module.database,
     aws_secretsmanager_secret.db_credential
   ]
 
-  # Ignore changes to secret_string to prevent Terraform from updating after initial creation
-  # This avoids conflicts with staging labels and allows manual updates if needed
   lifecycle {
     ignore_changes = [secret_string]
+  }
+}
+
+# Automatic password sync from RDS-managed secret to custom secret
+# This runs after database creation and whenever the RDS secret changes
+# Works automatically for all workspaces (dev, staging, prod)
+resource "null_resource" "sync_db_password" {
+  # Trigger when database or RDS secret ARN changes
+  triggers = {
+    db_instance_id      = module.database.db_instance_identifier
+    db_instance_address = module.database.db_instance_address
+    rds_secret_arn      = try(module.database.db_instance_master_user_secret_arn, "")
+    custom_secret_name  = aws_secretsmanager_secret.db_credential.name
+    region              = var.region
+    workspace           = terraform.workspace
+  }
+
+  # Wait for database and secret to be ready before syncing
+  depends_on = [
+    module.database,
+    aws_secretsmanager_secret_version.db_credential,
+    aws_secretsmanager_secret.db_credential
+  ]
+
+  # Sync password using the backup script
+  # This automatically reads from RDS-managed secret and updates our custom secret
+  # Works automatically for all workspaces (dev, staging, prod)
+  provisioner "local-exec" {
+    command = <<-EOT
+      # Change to infrastructure-web-app directory where sync script is located
+      cd "${path.module}/.."
+      
+      # Run the sync script with auto mode and wait flag
+      # The script automatically detects the current workspace and syncs the password
+      bash sync-db-password.sh --auto --wait || {
+        echo "Warning: Password sync script failed. This might be expected on first apply."
+        echo "The password will be synced on the next apply, or you can run the script manually."
+        exit 0  # Don't fail Terraform if sync fails (will retry on next apply)
+      }
+    EOT
   }
 }
 

@@ -82,4 +82,34 @@ DELETE_THESE_FILES.sh
 
 # Documentation archives (move troubleshooting docs here if keeping)
 docs/archive/
+
+
+# Files i don't want to commit or be tracked yet
+COMPARE_WORKSPACES_USAGE.md
+DEPLOYMENT_WORKFLOW.md
+PASSWORD_SYNC_FIX.md
+PASSWORD_SYNC_TERRAFORM_NATIVE.md
+PROMOTION_CHECKLIST.md
+WORKSPACE_COMPARISON.md
+WORKSPACE_NAMING_FIX.md
+WORKSPACE_TROUBLESHOOTING.md
+diagnose-workspace.sh
+fix-db-password.sh
+sync-db-password.sh
+workspace-diff.sh
+organize-for-git.sh
+organize-to-infrastructure.sh
+cloudwatch.tf 
+cloudwatch_dashboard.tf
+cloudwatch_anomaly_detection.tf
+CLOUDWATCH_ALARMS.md
+AUTOMATIC_PASSWORD_SYNC.md
+CLOUDWATCH_DASHBOARD.md
+MULTI_REGION_DR.md
+PROJECT_IMPROVEMENTS.md
+SECRETS_BEST_PRACTICES.md
+CLOUDWATCH_ANOMALY_DETECTION.md
+GIT_REMOTE_SETUP.md
+GIT_VS_WORKSPACES.md
 README.md.backup
+QUICK_COMPARE.md

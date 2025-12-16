@@ -45,16 +45,16 @@ fi
 sudo systemctl stop apache2 || true
 sudo systemctl disable apache2 || true
 
-# Install Python packages for PostgreSQL
-echo "Installing Python packages (Flask, psycopg2-binary, boto3)..."
-sudo -H pip3 install flask psycopg2-binary boto3 || {
+# Install Python packages for PostgreSQL and Prometheus
+echo "Installing Python packages (Flask, psycopg2-binary, boto3, prometheus-client)..."
+sudo -H pip3 install flask psycopg2-binary boto3 prometheus-client || {
     echo "⚠️  pip3 install failed, trying with --break-system-packages..."
-    sudo -H pip3 install --break-system-packages flask psycopg2-binary boto3
+    sudo -H pip3 install --break-system-packages flask psycopg2-binary boto3 prometheus-client
 }
 
 # Verify installation
 echo "Verifying Python packages..."
-python3 -c "import flask; import psycopg2; import boto3; print('✅ All packages installed successfully')" || {
+python3 -c "import flask; import psycopg2; import boto3; from prometheus_client import Counter; print('✅ All packages installed successfully')" || {
     echo "❌ Package verification failed, trying alternative installation..."
     sudo apt-get install -y python3-flask python3-psycopg2 python3-boto3 || true
     python3 -c "import flask; import psycopg2; import boto3; print('✅ Packages verified')" || echo "⚠️  Some packages may not be available"
@@ -71,12 +71,43 @@ cat << 'CLIENT_APP' > app.py
 import os
 import json
 import boto3
+import time
 from flask import Flask, request, render_template_string, redirect, url_for
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 app = Flask(__name__)
+
+# Prometheus Metrics
+REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+
+REQUEST_DURATION = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'endpoint']
+)
+
+ACTIVE_CLIENTS = Gauge(
+    'active_clients_total',
+    'Number of active clients in database'
+)
+
+DB_QUERY_DURATION = Histogram(
+    'db_query_duration_seconds',
+    'Database query duration in seconds',
+    ['query_type']
+)
+
+DB_CONNECTION_ERRORS = Counter(
+    'db_connection_errors_total',
+    'Total database connection errors'
+)
 
 # HTML Template
 CLIENT_FORM_HTML = """
@@ -259,9 +290,11 @@ def get_db_credentials():
 
 
 def get_db_connection():
+    import time as time_module  # Use explicit alias to avoid scoping issues
     max_retries = 3
     retry_delay = 2
     
+    start_time = time_module.time()
     for attempt in range(max_retries):
         try:
             creds = get_db_credentials()
@@ -277,6 +310,8 @@ def get_db_connection():
                 sslmode="require"  # RDS PostgreSQL requires SSL
             )
             
+            duration = time_module.time() - start_time
+            DB_QUERY_DURATION.labels(query_type='connection').observe(duration)
             print(f"✅ Database connection successful (attempt {attempt + 1})")
             return conn
             
@@ -286,16 +321,15 @@ def get_db_connection():
                 raise Exception(f"Database access denied: {e}")
             elif attempt < max_retries - 1:
                 print(f"⚠️  Connection attempt {attempt + 1} failed, retrying...")
-                import time
-                time.sleep(retry_delay)
+                time_module.sleep(retry_delay)
                 continue
             else:
                 raise Exception(f"Database connection failed: {e}")
         except Exception as e:
+            DB_CONNECTION_ERRORS.inc()
             print(f"❌ Database connection error: {e}")
             if attempt < max_retries - 1:
-                import time
-                time.sleep(retry_delay)
+                time_module.sleep(retry_delay)
                 continue
             raise
 
@@ -404,11 +438,13 @@ def index():
             cursor = conn.cursor()
             
             try:
+                query_start = time.time()
                 cursor.execute("""
                     INSERT INTO clients (name, email, phone, company, address, notes)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (name, email, phone or None, company or None, address or None, notes or None))
+                DB_QUERY_DURATION.labels(query_type='insert').observe(time.time() - query_start)
                 
                 result = cursor.fetchone()
                 client_id = result[0] if result else None
@@ -474,14 +510,17 @@ def list_clients():
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
+        query_start = time.time()
         cursor.execute("""
             SELECT id, name, email, phone, company, address, notes, 
                    created_at, updated_at
             FROM clients
             ORDER BY created_at DESC
         """)
+        DB_QUERY_DURATION.labels(query_type='select').observe(time.time() - query_start)
         
         clients = cursor.fetchall()
+        update_client_metrics()  # Update active clients count
         cursor.close()
         conn.close()
         
@@ -547,6 +586,55 @@ def health():
     }, 200
 
 
+# Prometheus metrics endpoint
+@app.route("/metrics")
+def metrics():
+    """Prometheus metrics endpoint"""
+    return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
+
+# Request instrumentation - track all HTTP requests
+@app.before_request
+def before_request():
+    """Record request start time"""
+    request.start_time = time.time()
+
+
+@app.after_request
+def after_request(response):
+    """Record request metrics after response"""
+    duration = time.time() - request.start_time
+    endpoint = request.endpoint or 'unknown'
+    
+    # Track request count
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=endpoint,
+        status=response.status_code
+    ).inc()
+    
+    # Track request duration
+    REQUEST_DURATION.labels(
+        method=request.method,
+        endpoint=endpoint
+    ).observe(duration)
+    
+    return response
+
+
+def update_client_metrics():
+    """Update active clients gauge metric"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM clients")
+        count = cursor.fetchone()[0]
+        ACTIVE_CLIENTS.set(count)
+        conn.close()
+    except Exception as e:
+        print(f"Error updating client metrics: {e}")
+
+
 if __name__ == "__main__":
     try:
         print("=== Client Management Application Starting ===")
@@ -559,7 +647,6 @@ if __name__ == "__main__":
         def init_db_async():
             """Initialize database in background thread"""
             try:
-                import time
                 time.sleep(5)  # Give Flask time to start first
                 print("Attempting database initialization in background...")
                 init_database()
@@ -639,6 +726,56 @@ else
     echo "⚠️  Flask service failed, but continuing userdata script..."
     echo "Service will be retried by systemd with Restart=on-failure"
     echo "You can check logs later with: sudo journalctl -u flaskapp -f"
+fi
+
+# Install and setup Node Exporter for system metrics
+echo "=== Setting up Node Exporter for Prometheus ==="
+NODE_EXPORTER_VERSION="1.6.1"  # Hardcoded - not a template variable
+
+# Create node_exporter user
+if ! id -u node_exporter > /dev/null 2>&1; then
+    sudo useradd --no-create-home --shell /bin/false node_exporter
+fi
+
+# Download and install Node Exporter
+cd /tmp
+if wget -q https://github.com/prometheus/node_exporter/releases/download/v$${NODE_EXPORTER_VERSION}/node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz; then
+    tar xzf node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz
+    sudo cp node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64/node_exporter /usr/local/bin/
+    sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+    rm -rf node_exporter-$${NODE_EXPORTER_VERSION}* || true
+    
+    # Create systemd service
+    sudo tee /etc/systemd/system/node_exporter.service > /dev/null <<NODEEOF
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+NODEEOF
+    
+    sudo systemctl daemon-reload
+    sudo systemctl enable node_exporter
+    sudo systemctl start node_exporter
+    
+    sleep 2
+    if sudo systemctl is-active --quiet node_exporter; then
+        echo "✅ Node Exporter is running on port 9100"
+    else
+        echo "⚠️  Node Exporter failed to start, check logs: sudo journalctl -u node_exporter"
+    fi
+else
+    echo "⚠️  Failed to download Node Exporter, continuing anyway..."
 fi
 
 echo "=== Client Management Application Setup Complete ==="

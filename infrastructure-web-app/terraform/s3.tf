@@ -47,14 +47,14 @@ resource "aws_s3_object" "userdata_script" {
   bucket = aws_s3_bucket.app_assets.id
   key    = "scripts/userdata_client_app.sh"
   content = templatefile("${path.module}/scripts/userdata_client_app.sh", {
-    secret_arn = aws_secretsmanager_secret.db_credential.arn
+    secret_arn = aws_secretsmanager_secret.db_credentials.arn
     region     = var.region
   })
   content_type = "text/x-shellscript"
 
   # Use content hash for change detection (best practice)
   etag = md5(templatefile("${path.module}/scripts/userdata_client_app.sh", {
-    secret_arn = aws_secretsmanager_secret.db_credential.arn
+    secret_arn = aws_secretsmanager_secret.db_credentials.arn
     region     = var.region
   }))
 
@@ -64,8 +64,8 @@ resource "aws_s3_object" "userdata_script" {
   }
 
   depends_on = [
-    aws_secretsmanager_secret.db_credential,
-    aws_secretsmanager_secret_version.db_credential
+    aws_secretsmanager_secret.db_credentials,
+    aws_secretsmanager_secret_version.db_credentials
   ]
 }
 

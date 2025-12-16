@@ -4,14 +4,17 @@ resource "aws_acm_certificate" "app-server-cert" {
   domain_name       = "${local.workspace_env}.${var.hosted_zone_name}"
   validation_method = "DNS"
 
+  # Include Grafana subdomain in the certificate
+  subject_alternative_names = [
+    "grafana.${local.workspace_env}.${var.hosted_zone_name}"
+  ]
+
   lifecycle {
     create_before_destroy = true
   }
   tags = {
     Name = "${local.name_prefix}-ssl-cert"
   }
-
-
 }
 
 resource "aws_route53_record" "app-server-cert-validation-record" {

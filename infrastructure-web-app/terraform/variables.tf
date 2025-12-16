@@ -121,10 +121,17 @@ variable "s3_bucket_name" {
   default     = "dev-web-app"
 }
 
+variable "force_delete_secret" {
+  description = "Force delete the secret"
+  type        = bool
+  default     = true
+}
+
+
 variable "hosted_zone_name" {
   description = "Name of the hosted zone"
   type        = string
-  default     = "226839593180.realhandsonlabs.net"
+  default     = "767397975931.realhandsonlabs.net"
 }
 
 variable "db_username" {
@@ -208,4 +215,14 @@ variable "alarm_alb_response_time_threshold" {
   description = "Threshold for ALB target response time alarm (seconds)"
   type        = number
   default     = 2.0 # Alert if average response time > 2 seconds
+}
+
+# ============================================================================
+# Prometheus Configuration
+# ============================================================================
+
+variable "enable_prometheus_config_backup" {
+  description = "Enable backup of Prometheus configuration to S3"
+  type        = bool
+  default     = false
 }

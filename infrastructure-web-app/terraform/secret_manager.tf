@@ -2,17 +2,18 @@
 
 # Secret for RDS database credentials
 # This secret stores the connection information for the RDS PostgreSQL instance
-resource "aws_secretsmanager_secret" "db_credential" {
-  name        = "${local.name_prefix}-db-credential"
+resource "aws_secretsmanager_secret" "db_credentials" {
+  name        = "${local.name_prefix}-db-credentials"
   description = "RDS database credentials for ${local.name_prefix} application"
 
   # Set recovery window to 0 for immediate deletion on terraform destroy
   # Without this, secrets are scheduled for deletion with a 7-30 day recovery window
   # Setting to 0 ensures the secret is permanently deleted immediately
-  recovery_window_in_days = 0
+  recovery_window_in_days = var.force_delete_secret ? 0 : 7
+  
 
   tags = {
-    Name        = "${local.name_prefix}-db-credential"
+    Name        = "${local.name_prefix}-db-credentials"
     Environment = var.environment
     ManagedBy   = "terraform"
   }
@@ -20,8 +21,8 @@ resource "aws_secretsmanager_secret" "db_credential" {
 
 # Initial secret version with placeholder credentials
 # This will be automatically updated by the sync resource below
-resource "aws_secretsmanager_secret_version" "db_credential" {
-  secret_id = aws_secretsmanager_secret.db_credential.id
+resource "aws_secretsmanager_secret_version" "db_credentials" {
+  secret_id = aws_secretsmanager_secret.db_credentials.id
 
   # Initial placeholder - will be synced automatically from RDS-managed secret
   secret_string = jsonencode({
@@ -35,7 +36,7 @@ resource "aws_secretsmanager_secret_version" "db_credential" {
 
   depends_on = [
     module.database,
-    aws_secretsmanager_secret.db_credential
+    aws_secretsmanager_secret.db_credentials
   ]
 
   lifecycle {
@@ -52,7 +53,7 @@ resource "null_resource" "sync_db_password" {
     db_instance_id      = module.database.db_instance_identifier
     db_instance_address = module.database.db_instance_address
     rds_secret_arn      = try(module.database.db_instance_master_user_secret_arn, "")
-    custom_secret_name  = aws_secretsmanager_secret.db_credential.name
+    custom_secret_name  = aws_secretsmanager_secret.db_credentials.name
     region              = var.region
     workspace           = terraform.workspace
   }
@@ -60,8 +61,8 @@ resource "null_resource" "sync_db_password" {
   # Wait for database and secret to be ready before syncing
   depends_on = [
     module.database,
-    aws_secretsmanager_secret_version.db_credential,
-    aws_secretsmanager_secret.db_credential
+    aws_secretsmanager_secret_version.db_credentials,
+    aws_secretsmanager_secret.db_credentials
   ]
 
   # Sync password using the backup script
@@ -98,7 +99,7 @@ resource "aws_iam_policy" "secrets_manager_read" {
           "secretsmanager:DescribeSecret"
         ]
         Resource = [
-          aws_secretsmanager_secret.db_credential.arn,
+          aws_secretsmanager_secret.db_credentials.arn,
           try(module.database.db_instance_master_user_secret_arn, "")
         ]
       }

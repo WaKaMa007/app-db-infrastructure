@@ -72,18 +72,69 @@ output "ssm_connect_command" {
 
 output "db_secret_arn" {
   description = "ARN of the Secrets Manager secret containing database credentials"
-  value       = aws_secretsmanager_secret.db_credential.arn
+  value       = aws_secretsmanager_secret.db_credentials.arn
 }
 
 output "secret_name" {
   description = "Name of the Secrets Manager secret"
-  value       = aws_secretsmanager_secret.db_credential.name
+  value       = aws_secretsmanager_secret.db_credentials.name
 }
 
 output "db_instance_id" {
   description = "RDS database instance identifier"
   value       = module.database.db_instance_identifier
 }
+
+# Prometheus and Grafana outputs
+output "prometheus_instance_id" {
+  description = "Prometheus server instance ID"
+  value       = try(aws_instance.prometheus.id, null)
+}
+
+output "prometheus_private_ip" {
+  description = "Prometheus server private IP address"
+  value       = try(aws_instance.prometheus.private_ip, null)
+}
+
+output "grafana_instance_id" {
+  description = "Grafana server instance ID"
+  value       = try(aws_instance.grafana.id, null)
+}
+
+output "grafana_private_ip" {
+  description = "Grafana server private IP address"
+  value       = try(aws_instance.grafana.private_ip, null)
+}
+
+output "prometheus_url" {
+  description = "Prometheus UI URL (via SSM port forwarding)"
+  value       = try("http://${aws_instance.prometheus.private_ip}:9090", null)
+}
+
+output "grafana_url" {
+  description = "Grafana UI URL (via ALB)"
+  value       = try("https://grafana.${local.workspace_env}.${var.hosted_zone_name}", null)
+}
+
+output "grafana_private_url" {
+  description = "Grafana UI URL (via SSM port forwarding)"
+  value       = try("http://${aws_instance.grafana.private_ip}:3000", null)
+}
+
+output "access_instructions" {
+  description = "Instructions to access Prometheus and Grafana"
+  value       = <<-EOT
+    Grafana Access:
+      URL: https://grafana.${local.workspace_env}.${var.hosted_zone_name}
+      Default credentials: admin / admin (CHANGE THIS!)
+    
+    Prometheus Access (via SSM):
+      aws ssm start-session --target ${try(aws_instance.prometheus.id, "N/A")} \\
+        --document-name AWS-StartPortForwardingSessionToRemoteHost \\
+        --parameters '{"host":["${try(aws_instance.prometheus.private_ip, "")}"],"portNumber":["9090"],"localPortNumber":["9090"]}'
+      Then open: http://localhost:9090
+  EOT
+} 
 
 
 

@@ -72,6 +72,24 @@ resource "aws_security_group" "app-server-sg" {
     description     = "Allow HTTPS from ALB"
   }
 
+  # Allow Prometheus to scrape application metrics endpoint
+  ingress {
+    from_port       = 5000
+    to_port         = 5000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.prometheus.id]
+    description     = "Allow Prometheus to scrape /metrics endpoint"
+  }
+
+  # Allow Prometheus to scrape Node Exporter (system metrics)
+  ingress {
+    from_port       = 9100
+    to_port         = 9100
+    protocol        = "tcp"
+    security_groups = [aws_security_group.prometheus.id]
+    description     = "Allow Prometheus to scrape Node Exporter"
+  }
+
   # Allow all outbound traffic
   egress {
     from_port   = 0

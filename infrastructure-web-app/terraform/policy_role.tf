@@ -26,7 +26,7 @@ resource "aws_iam_policy" "app-server-policy" {
         Action = [
           "secretsmanager:GetSecretValue"
         ]
-        Resource = aws_secretsmanager_secret.db_credential.arn
+        Resource = aws_secretsmanager_secret.db_credentials.arn
       },
       {
         Effect = "Allow"
@@ -63,7 +63,7 @@ resource "aws_iam_policy" "app-server-policy" {
 
   depends_on = [
     aws_s3_bucket.app_assets,
-    aws_secretsmanager_secret.db_credential
+    aws_secretsmanager_secret.db_credentials
   ]
 }
 

@@ -25,7 +25,7 @@ resource "aws_launch_template" "app-server-lt" {
   # Ensure database, secrets, IAM profile, and S3 script are created before launch template
   depends_on = [
     module.database,
-    aws_secretsmanager_secret_version.db_credential,
+    aws_secretsmanager_secret_version.db_credentials,
     aws_iam_instance_profile.app-server-instance-profile,
     aws_s3_object.userdata_script # Ensure S3 script is uploaded before launch template
   ]

@@ -246,10 +246,12 @@ jobs:
             echo "status=existing" >> $GITHUB_OUTPUT
           else
             # Start new instance refresh
+            # Note: AutoRollback=false because we don't provide DesiredConfiguration
+            # The instance refresh will update instances to match the current launch template
             REFRESH_ID=$(aws autoscaling start-instance-refresh \
               --auto-scaling-group-name "$ASG_NAME" \
               --region "$REGION" \
-              --preferences "MinHealthyPercentage=50,InstanceWarmup=120,AutoRollback=true" \
+              --preferences "MinHealthyPercentage=50,InstanceWarmup=120,AutoRollback=false" \
               --query 'InstanceRefreshId' \
               --output text)
             

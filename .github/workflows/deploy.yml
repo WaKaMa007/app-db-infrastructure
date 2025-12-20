@@ -78,14 +78,42 @@ jobs:
             -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
             -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
           terraform workspace select ${{ steps.workspace.outputs.workspace }} || terraform workspace new ${{ steps.workspace.outputs.workspace }}
-          # Get output, filtering out warnings and special characters
-          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
-          if [ -z "$S3_BUCKET" ]; then
+          
+          # Get output using -json flag for cleaner parsing, then filter properly
+          # First try -raw flag
+          S3_BUCKET_RAW=$(terraform output -raw s3_bucket_app_assets 2>&1)
+          
+          # Filter out all Terraform formatting characters and warnings
+          S3_BUCKET=$(echo "$S3_BUCKET_RAW" | \
+            sed 's/[╷╵│─┐┘┌└├┤┬┴┼]//g' | \
+            grep -v "Warning" | \
+            grep -v "Error" | \
+            grep -v "No outputs found" | \
+            grep -v "^$" | \
+            head -1 | \
+            tr -d '[:space:]"' || echo "")
+          
+          # If that didn't work, try using -json flag
+          if [ -z "$S3_BUCKET" ] || [ "${#S3_BUCKET}" -lt 3 ] || [[ "$S3_BUCKET" =~ [╷╵│─] ]]; then
+            echo "⚠️  Raw output method failed, trying JSON method..."
+            S3_BUCKET=$(terraform output -json s3_bucket_app_assets 2>&1 | \
+              python3 -c "import sys, json; print(json.load(sys.stdin)['value'])" 2>/dev/null || echo "")
+          fi
+          
+          # Verify we got a valid bucket name
+          if [ -z "$S3_BUCKET" ] || [ "${#S3_BUCKET}" -lt 3 ]; then
             echo "❌ Could not get S3 bucket name from Terraform outputs"
-            echo "   This might mean the workspace is empty or outputs don't exist yet."
-            echo "   If this is a new workspace, run 'terraform apply' first."
+            echo "   Raw output was:"
+            echo "$S3_BUCKET_RAW"
+            echo ""
+            echo "   This might mean:"
+            echo "   - The workspace is empty (run 'terraform apply' first)"
+            echo "   - The output doesn't exist yet"
+            echo "   - Terraform state is not accessible"
             exit 1
           fi
+          
+          echo "✅ S3 Bucket Name: $S3_BUCKET"
           echo "bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
 
       - name: Prepare Application Code

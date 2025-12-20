@@ -143,26 +143,22 @@ jobs:
             exit 1
           fi
           
-          # Get output using -json flag for cleaner parsing (more reliable)
+          # Get output using -raw flag (simplest and most reliable)
           echo "📋 Retrieving S3 bucket name from Terraform output..."
-          S3_BUCKET=$(terraform output -json s3_bucket_app_assets 2>&1)
+          S3_BUCKET_RAW=$(terraform output -raw s3_bucket_app_assets 2>&1)
           
-          # Check if we got valid JSON
-          if echo "$S3_BUCKET" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
-            # Extract value from JSON
-            S3_BUCKET=$(echo "$S3_BUCKET" | python3 -c "import sys, json; print(json.load(sys.stdin)['value'])" 2>/dev/null || echo "")
-          else
-            # Fallback to raw output if JSON parsing fails
-            echo "⚠️  JSON parsing failed, trying raw output..."
-            S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | \
-              sed 's/[╷╵│─┐┘┌└├┤┬┴┼]//g' | \
-              grep -v "Warning" | \
-              grep -v "Error" | \
-              grep -v "No outputs found" | \
-              grep -v "^$" | \
-              head -1 | \
-              tr -d '[:space:]"')
-          fi
+          # Clean the raw output - remove quotes, whitespace, and formatting characters
+          S3_BUCKET=$(echo "$S3_BUCKET_RAW" | \
+            sed 's/[╷╵│─┐┘┌└├┤┬┴┼]//g' | \
+            sed 's/^[[:space:]]*"*//' | \
+            sed 's/"*[[:space:]]*$//' | \
+            sed 's/^[[:space:]]*//' | \
+            sed 's/[[:space:]]*$//' | \
+            grep -v "Warning" | \
+            grep -v "Error" | \
+            grep -v "No outputs found" | \
+            grep -v "^$" | \
+            head -1)
           
           # Verify we got a valid bucket name
           if [ -z "$S3_BUCKET" ] || [ "${#S3_BUCKET}" -lt 3 ]; then

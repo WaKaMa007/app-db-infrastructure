@@ -28,8 +28,10 @@ jobs:
   deploy-app:
     name: Deploy Application
     runs-on: ubuntu-latest
+    # Determine environment: use input if provided, otherwise default to 'prod' for master branch
+    # Note: For workflow_run triggers, we'll determine the actual environment in the steps
     environment:
-      name: ${{ github.event.inputs.environment || 'dev' }}
+      name: ${{ github.event.inputs.environment || 'prod' }}
       url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
     steps:
@@ -46,8 +48,18 @@ jobs:
       - name: Determine workspace
         id: workspace
         run: |
-          if [ "${{ github.event.inputs.environment }}" != "" ]; then
+          # Determine environment from input or triggering workflow branch
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.environment }}" ]; then
             echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "workflow_run" ]; then
+            TRIGGER_BRANCH="${{ github.event.workflow_run.head_branch }}"
+            if [ "$TRIGGER_BRANCH" == "master" ]; then
+              echo "workspace=prod" >> $GITHUB_OUTPUT
+            elif [ "$TRIGGER_BRANCH" == "staging" ]; then
+              echo "workspace=staging" >> $GITHUB_OUTPUT
+            else
+              echo "workspace=dev" >> $GITHUB_OUTPUT
+            fi
           else
             echo "workspace=dev" >> $GITHUB_OUTPUT
           fi

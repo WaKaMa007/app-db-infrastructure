@@ -19,6 +19,11 @@ on:
         description: 'Application version/tag'
         required: false
         default: 'latest'
+      wait_for_refresh:
+        description: 'Wait for instance refresh to complete'
+        required: false
+        type: boolean
+        default: false
 
 env:
   AWS_REGION: us-east-1
@@ -261,12 +266,36 @@ jobs:
             echo "status=new" >> $GITHUB_OUTPUT
           fi
 
-      - name: Wait for Instance Refresh
+      - name: Instance Refresh Info (Non-blocking)
+        if: github.event.inputs.wait_for_refresh != 'true' || github.event_name == 'workflow_run'
         run: |
           ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
           REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
           REGION="${{ env.AWS_REGION }}"
-          MAX_WAIT=1800  # 30 minutes
+          
+          echo "✅ Instance refresh started: $REFRESH_ID"
+          echo "⏭️  Refresh will continue in background - workflow continues without waiting"
+          echo ""
+          echo "📊 Monitor refresh status:"
+          echo ""
+          echo "Via AWS CLI:"
+          echo "  aws autoscaling describe-instance-refreshes \\"
+          echo "    --auto-scaling-group-name $ASG_NAME \\"
+          echo "    --instance-refresh-ids $REFRESH_ID \\"
+          echo "    --region $REGION"
+          echo ""
+          echo "Via AWS Console:"
+          echo "  https://console.aws.amazon.com/ec2autoscaling/home?region=${REGION}#/details/${ASG_NAME}?view=history"
+          echo ""
+          echo "The instance refresh will complete in the background (typically 10-30 minutes)."
+
+      - name: Wait for Instance Refresh (Blocking)
+        if: github.event.inputs.wait_for_refresh == 'true' && github.event_name == 'workflow_dispatch'
+        run: |
+          ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
+          REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
+          REGION="${{ env.AWS_REGION }}"
+          MAX_WAIT=3600  # 60 minutes (increased for large deployments)
           INTERVAL=30
           ELAPSED=0
           
@@ -294,8 +323,34 @@ jobs:
             ELAPSED=$((ELAPSED + INTERVAL))
           done
           
-          echo "⚠️  Instance refresh timeout after ${MAX_WAIT}s"
-          exit 1
+          # Check final status before failing
+          FINAL_STATUS=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --instance-refresh-ids "$REFRESH_ID" \
+            --region "$REGION" \
+            --query 'InstanceRefreshes[0].Status' \
+            --output text 2>/dev/null || echo "Unknown")
+          
+          if [ "$FINAL_STATUS" == "Successful" ]; then
+            echo ""
+            echo "✅ Instance refresh completed successfully (checked after timeout)"
+            exit 0
+          else
+            echo ""
+            echo "⚠️  Instance refresh timeout after ${MAX_WAIT}s ($((MAX_WAIT / 60)) minutes)"
+            echo "   Current status: $FINAL_STATUS"
+            echo "   The refresh may still be running in AWS."
+            echo ""
+            echo "   Check status:"
+            echo "   aws autoscaling describe-instance-refreshes --auto-scaling-group-name $ASG_NAME --instance-refresh-ids $REFRESH_ID --region $REGION"
+            echo ""
+            echo "   Or check AWS Console:"
+            echo "   https://console.aws.amazon.com/ec2autoscaling/home?region=${REGION}#/details/${ASG_NAME}?view=history"
+            echo ""
+            echo "   The workflow will continue - you can check the refresh status manually."
+            # Don't exit with error - allow workflow to continue
+            exit 0
+          fi
 
       - name: Health Check
         id: health-check

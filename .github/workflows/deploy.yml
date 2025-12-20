@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     # Determine environment: use input if provided, otherwise default to 'prod' for master branch
     # Note: For workflow_run triggers, we'll determine the actual environment in the steps
+    # #########################################################
     environment:
       name: ${{ github.event.inputs.environment || 'prod' }}
       url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

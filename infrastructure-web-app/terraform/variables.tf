@@ -131,7 +131,7 @@ variable "force_delete_secret" {
 variable "hosted_zone_name" {
   description = "Name of the hosted zone"
   type        = string
-  default     = "767397975931.realhandsonlabs.net"
+  default     = "381492052417.realhandsonlabs.net"  # This is the hosted zone name for the domain
 }
 
 variable "db_username" {

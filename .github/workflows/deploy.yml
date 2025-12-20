@@ -1,0 +1,236 @@
+name: Application Deployment
+
+on:
+  workflow_run:
+    workflows: ["Terraform Deploy"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      version:
+        description: 'Application version/tag'
+        required: false
+        default: 'latest'
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: infrastructure-web-app/terraform
+
+jobs:
+  deploy-app:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine workspace
+        id: workspace
+        run: |
+          if [ "${{ github.event.inputs.environment }}" != "" ]; then
+            echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Get S3 Bucket Name
+        id: s3-bucket
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
+          terraform workspace select ${{ steps.workspace.outputs.workspace }} || terraform workspace new ${{ steps.workspace.outputs.workspace }}
+          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>/dev/null || echo "")
+          echo "bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          if [ -z "$S3_BUCKET" ]; then
+            echo "❌ Could not get S3 bucket name from Terraform outputs"
+            exit 1
+          fi
+
+      - name: Prepare Application Code
+        id: prepare-app
+        run: |
+          # Create a deployment package
+          mkdir -p /tmp/app-deploy
+          
+          # If application directory exists, use it
+          if [ -d "application" ]; then
+            cp -r application/* /tmp/app-deploy/
+          else
+            # Otherwise, extract from userdata script (fallback)
+            echo "⚠️  No application directory found, using userdata script"
+            cp infrastructure-web-app/terraform/scripts/userdata_client_app.sh /tmp/app-deploy/
+          fi
+          
+          # Create version file
+          echo "${{ github.event.inputs.version || github.sha }}" > /tmp/app-deploy/VERSION
+          echo "${{ github.run_id }}" > /tmp/app-deploy/DEPLOY_ID
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/app-deploy/DEPLOY_TIME
+          
+          # Calculate checksum
+          cd /tmp/app-deploy
+          find . -type f -exec sha256sum {} \; | sha256sum | cut -d' ' -f1 > CHECKSUM
+          
+          echo "deploy_path=/tmp/app-deploy" >> $GITHUB_OUTPUT
+
+      - name: Upload to S3
+        run: |
+          echo "Uploading application to S3 bucket: ${{ steps.s3-bucket.outputs.bucket }}"
+          aws s3 sync ${{ steps.prepare-app.outputs.deploy_path }} \
+            s3://${{ steps.s3-bucket.outputs.bucket }}/scripts/ \
+            --region ${{ env.AWS_REGION }} \
+            --delete
+
+      - name: Get ASG Name
+        id: asg-name
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          ASG_NAME=$(terraform output -raw instance_count 2>/dev/null | head -1 || echo "")
+          # Try to get ASG name from AWS directly
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --region ${{ env.AWS_REGION }} \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
+            --output text | head -1)
+          
+          if [ -z "$ASG_NAME" ]; then
+            echo "❌ Could not find ASG name"
+            exit 1
+          fi
+          
+          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Trigger Instance Refresh
+        id: instance-refresh
+        run: |
+          ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
+          REGION="${{ env.AWS_REGION }}"
+          
+          echo "Starting instance refresh for ASG: $ASG_NAME"
+          
+          # Check if refresh is already in progress
+          ACTIVE_REFRESH=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region "$REGION" \
+            --query 'InstanceRefreshes[?Status==`InProgress` || Status==`Pending`].InstanceRefreshId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$ACTIVE_REFRESH" ] && [ "$ACTIVE_REFRESH" != "None" ]; then
+            echo "⚠️  Instance refresh already in progress: $ACTIVE_REFRESH"
+            echo "refresh_id=$ACTIVE_REFRESH" >> $GITHUB_OUTPUT
+            echo "status=existing" >> $GITHUB_OUTPUT
+          else
+            # Start new instance refresh
+            REFRESH_ID=$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --region "$REGION" \
+              --preferences "MinHealthyPercentage=50,InstanceWarmup=120,AutoRollback=true" \
+              --query 'InstanceRefreshId' \
+              --output text)
+            
+            echo "✅ Instance refresh started: $REFRESH_ID"
+            echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+            echo "status=new" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Wait for Instance Refresh
+        run: |
+          ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
+          REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
+          REGION="${{ env.AWS_REGION }}"
+          MAX_WAIT=1800  # 30 minutes
+          INTERVAL=30
+          ELAPSED=0
+          
+          echo "Monitoring instance refresh: $REFRESH_ID"
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --region "$REGION" \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            
+            echo "Refresh status: $STATUS (elapsed: ${ELAPSED}s)"
+            
+            if [ "$STATUS" == "Successful" ]; then
+              echo "✅ Instance refresh completed successfully"
+              exit 0
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ]; then
+              echo "❌ Instance refresh $STATUS"
+              exit 1
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          echo "⚠️  Instance refresh timeout after ${MAX_WAIT}s"
+          exit 1
+
+      - name: Health Check
+        id: health-check
+        run: |
+          # Get ALB URL from Terraform output
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>/dev/null || echo "")
+          
+          if [ -z "$ALB_URL" ]; then
+            echo "⚠️  Could not get ALB URL, skipping health check"
+            exit 0
+          fi
+          
+          echo "Performing health check on: $ALB_URL"
+          
+          MAX_RETRIES=10
+          RETRY_DELAY=30
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            if curl -f -s "$ALB_URL/health" > /dev/null; then
+              echo "✅ Health check passed"
+              exit 0
+            fi
+            echo "Health check attempt $i/$MAX_RETRIES failed, retrying in ${RETRY_DELAY}s..."
+            sleep $RETRY_DELAY
+          done
+          
+          echo "❌ Health check failed after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ steps.workspace.outputs.workspace }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ github.event.inputs.version || github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket:** ${{ steps.s3-bucket.outputs.bucket }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ASG:** ${{ steps.asg-name.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance Refresh:** ${{ steps.instance-refresh.outputs.refresh_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+

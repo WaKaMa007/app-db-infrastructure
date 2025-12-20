@@ -1,0 +1,238 @@
+name: Terraform Deploy
+
+on:
+  push:
+    branches:
+      - master
+      - staging
+      - dev
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: 'Terraform action'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: infrastructure-web-app/terraform
+
+jobs:
+  determine-environment:
+    name: Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      workspace: ${{ steps.set-env.outputs.workspace }}
+      action: ${{ steps.set-env.outputs.action }}
+    steps:
+      - name: Set environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "workspace=prod" >> $GITHUB_OUTPUT
+            echo "action=apply" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/staging" ]; then
+            echo "workspace=staging" >> $GITHUB_OUTPUT
+            echo "action=apply" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=dev" >> $GITHUB_OUTPUT
+            echo "action=apply" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    if: needs.determine-environment.outputs.action != 'destroy'
+    outputs:
+      plan-exists: ${{ steps.plan.outputs.plan-exists }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}"
+
+      - name: Select Terraform workspace
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform workspace select ${{ needs.determine-environment.outputs.workspace }} || \
+          terraform workspace new ${{ needs.determine-environment.outputs.workspace }}
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform plan -no-color -out=tfplan | tee plan_output.txt
+          if [ -f tfplan ]; then
+            echo "plan-exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.workspace }}
+          path: |
+            ${{ env.TERRAFORM_DIR }}/tfplan
+            ${{ env.TERRAFORM_DIR }}/plan_output.txt
+
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TERRAFORM_DIR }}/plan_output.txt', 'utf8');
+            const maxLength = 65536;
+            const truncatedPlan = plan.length > maxLength ? plan.substring(0, maxLength) + '\n... (truncated)' : plan;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan Results for ${{ needs.determine-environment.outputs.workspace }}\n\n\`\`\`\n${truncatedPlan}\n\`\`\``
+            });
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [determine-environment, terraform-plan]
+    if: |
+      needs.determine-environment.outputs.action == 'apply' &&
+      needs.terraform-plan.outputs.plan-exists == 'true'
+    environment:
+      name: ${{ needs.determine-environment.outputs.workspace }}
+      # Require approval for production
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.workspace }}
+          path: ${{ env.TERRAFORM_DIR }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}"
+
+      - name: Select Terraform workspace
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform workspace select ${{ needs.determine-environment.outputs.workspace }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: outputs
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          echo "alb_url=$(terraform output -raw alb_https_url 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "asg_name=$(terraform output -raw instance_count 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+
+      - name: Notify Success
+        if: success()
+        run: |
+          echo "✅ Terraform apply completed successfully for ${{ needs.determine-environment.outputs.workspace }}"
+          echo "ALB URL: ${{ steps.outputs.outputs.alb_url }}"
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    if: |
+      needs.determine-environment.outputs.action == 'destroy' &&
+      needs.determine-environment.outputs.workspace != 'prod'
+    environment:
+      name: ${{ needs.determine-environment.outputs.workspace }}-destroy
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}"
+
+      - name: Select Terraform workspace
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform workspace select ${{ needs.determine-environment.outputs.workspace }}
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform destroy -auto-approve
+

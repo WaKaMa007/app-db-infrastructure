@@ -1,0 +1,193 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - master
+      - dev
+      - staging
+  push:
+    branches:
+      - dev
+      - staging
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: infrastructure-web-app/terraform
+
+jobs:
+  lint-and-validate:
+    name: Lint and Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install flake8 pytest
+          # Install app dependencies if requirements.txt exists
+          if [ -f application/requirements.txt ]; then
+            pip install -r application/requirements.txt
+          fi
+
+      - name: Lint Python code
+        continue-on-error: true
+        run: |
+          if [ -d "application" ]; then
+            flake8 application/ --count --select=E9,F63,F7,F82 --show-source --statistics
+            flake8 application/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+          else
+            echo "No application directory found, skipping Python linting"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform validate
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov
+          if [ -f application/requirements.txt ]; then
+            pip install -r application/requirements.txt
+          fi
+
+      - name: Run unit tests
+        continue-on-error: true
+        env:
+          FLASK_ENV: test
+        run: |
+          if [ -d "application/tests" ]; then
+            pytest application/tests/test_unit.py -v --cov=application --cov-report=xml
+          else
+            echo "No tests directory found, skipping unit tests"
+          fi
+
+      - name: Upload coverage
+        if: always()
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Determine workspace
+        id: workspace
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "workspace=prod" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "workspace=staging" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}"
+
+      - name: Select Terraform workspace
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform workspace select ${{ steps.workspace.outputs.workspace }} || terraform workspace new ${{ steps.workspace.outputs.workspace }}
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform plan -no-color -out=tfplan | tee plan_output.txt
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TERRAFORM_DIR }}/plan_output.txt', 'utf8');
+            const maxLength = 65536; // GitHub comment limit
+            const truncatedPlan = plan.length > maxLength ? plan.substring(0, maxLength) + '\n... (truncated)' : plan;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan Results\n\n\`\`\`\n${truncatedPlan}\n\`\`\``
+            });
+
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [lint-and-validate, unit-tests, terraform-plan]
+    if: always()
+
+    steps:
+      - name: Check CI status
+        run: |
+          echo "✅ All CI checks completed"
+          echo "Lint: ${{ needs.lint-and-validate.result }}"
+          echo "Tests: ${{ needs.unit-tests.result }}"
+          echo "Terraform Plan: ${{ needs.terraform-plan.result }}"
+

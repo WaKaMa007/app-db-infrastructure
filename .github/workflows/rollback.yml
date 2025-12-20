@@ -1,0 +1,276 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      rollback_type:
+        description: 'Rollback type'
+        required: true
+        type: choice
+        options:
+          - s3_version
+          - previous_terraform_state
+          - manual
+        default: 's3_version'
+      s3_version_id:
+        description: 'S3 version ID to rollback to (for s3_version type)'
+        required: false
+
+  workflow_run:
+    workflows: ["Application Deployment", "Blue/Green Deployment", "Canary Deployment"]
+    types:
+      - completed
+    branches:
+      - master
+      - staging
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: infrastructure-web-app/terraform
+
+jobs:
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure')
+    environment:
+      name: ${{ github.event.inputs.environment || 'prod' }}
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Determine workspace
+        id: workspace
+        run: |
+          if [ "${{ github.event.inputs.environment }}" != "" ]; then
+            echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.workflow_run.head_branch }}" == "main" ]; then
+            echo "workspace=prod" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.workflow_run.head_branch }}" == "staging" ]; then
+            echo "workspace=staging" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Infrastructure Info
+        id: infra
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
+          terraform workspace select ${{ steps.workspace.outputs.workspace }}
+          
+          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>/dev/null || echo "")
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --region ${{ env.AWS_REGION }} \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
+            --output text | head -1)
+          
+          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
+
+      - name: List S3 Versions
+        id: s3-versions
+        if: github.event.inputs.rollback_type == 's3_version'
+        run: |
+          S3_BUCKET="${{ steps.infra.outputs.s3_bucket }}"
+          S3_KEY="scripts/userdata_client_app.sh"
+          
+          echo "Listing versions for s3://$S3_BUCKET/$S3_KEY"
+          
+          # List object versions (last 10)
+          aws s3api list-object-versions \
+            --bucket "$S3_BUCKET" \
+            --prefix "$S3_KEY" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Versions[0:10].[VersionId,LastModified,IsLatest]' \
+            --output table
+          
+          # Get previous version (not latest)
+          PREV_VERSION=$(aws s3api list-object-versions \
+            --bucket "$S3_BUCKET" \
+            --prefix "$S3_KEY" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Versions[?IsLatest==`false`][0].VersionId' \
+            --output text)
+          
+          if [ -z "$PREV_VERSION" ] || [ "$PREV_VERSION" == "None" ]; then
+            echo "❌ No previous version found"
+            exit 1
+          fi
+          
+          echo "Previous version: $PREV_VERSION"
+          echo "version_id=$PREV_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Rollback S3 Version
+        id: rollback-s3
+        if: |
+          github.event.inputs.rollback_type == 's3_version' &&
+          (steps.s3-versions.outputs.version_id != '' || github.event.inputs.s3_version_id != '')
+        run: |
+          S3_BUCKET="${{ steps.infra.outputs.s3_bucket }}"
+          S3_KEY="scripts/userdata_client_app.sh"
+          
+          if [ "${{ github.event.inputs.s3_version_id }}" != "" ]; then
+            VERSION_ID="${{ github.event.inputs.s3_version_id }}"
+          else
+            VERSION_ID="${{ steps.s3-versions.outputs.version_id }}"
+          fi
+          
+          echo "🔄 Rolling back to S3 version: $VERSION_ID"
+          
+          # Copy previous version to current
+          aws s3api copy-object \
+            --bucket "$S3_BUCKET" \
+            --copy-source "$S3_BUCKET/$S3_KEY?versionId=$VERSION_ID" \
+            --key "$S3_KEY" \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ S3 rollback complete"
+
+      - name: Trigger Instance Refresh (Rollback)
+        id: instance-refresh
+        run: |
+          ASG_NAME="${{ steps.infra.outputs.asg_name }}"
+          
+          echo "🔄 Starting instance refresh to rollback deployment..."
+          
+          # Cancel any active refresh
+          ACTIVE_REFRESH=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'InstanceRefreshes[?Status==`InProgress` || Status==`Pending`].InstanceRefreshId' \
+            --output text | head -1)
+          
+          if [ -n "$ACTIVE_REFRESH" ] && [ "$ACTIVE_REFRESH" != "None" ]; then
+            echo "Cancelling active refresh: $ACTIVE_REFRESH"
+            aws autoscaling cancel-instance-refresh \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-id "$ACTIVE_REFRESH" \
+              --region ${{ env.AWS_REGION }} || true
+            
+            # Wait a bit for cancellation
+            sleep 30
+          fi
+          
+          # Start rollback instance refresh
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --preferences "MinHealthyPercentage=50,InstanceWarmup=120,AutoRollback=false" \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          echo "✅ Rollback instance refresh started: $REFRESH_ID"
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Rollback Completion
+        run: |
+          ASG_NAME="${{ steps.infra.outputs.asg_name }}"
+          REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
+          MAX_WAIT=1800
+          INTERVAL=30
+          ELAPSED=0
+          
+          echo "Waiting for rollback to complete..."
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            
+            echo "Rollback status: $STATUS (elapsed: ${ELAPSED}s)"
+            
+            if [ "$STATUS" == "Successful" ]; then
+              echo "✅ Rollback completed successfully"
+              exit 0
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ]; then
+              echo "❌ Rollback $STATUS"
+              exit 1
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          echo "⚠️  Rollback timeout after ${MAX_WAIT}s"
+          exit 1
+
+      - name: Verify Rollback
+        run: |
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>/dev/null || echo "")
+          
+          if [ -z "$ALB_URL" ]; then
+            echo "⚠️  Could not get ALB URL, skipping verification"
+            exit 0
+          fi
+          
+          echo "Verifying rollback health..."
+          
+          MAX_RETRIES=10
+          RETRY_DELAY=30
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            if curl -f -s "$ALB_URL/health" > /dev/null; then
+              echo "✅ Rollback verification passed"
+              exit 0
+            fi
+            echo "Verification attempt $i/$MAX_RETRIES failed, retrying..."
+            sleep $RETRY_DELAY
+          done
+          
+          echo "❌ Rollback verification failed"
+          exit 1
+
+      - name: Rollback Summary
+        if: always()
+        run: |
+          echo "## Rollback Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ steps.workspace.outputs.workspace }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rollback Type:** ${{ github.event.inputs.rollback_type || 'automatic' }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.rollback_type }}" == "s3_version" ]; then
+            echo "- **S3 Version:** ${{ steps.s3-versions.outputs.version_id || github.event.inputs.s3_version_id }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **ASG:** ${{ steps.infra.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance Refresh:** ${{ steps.instance-refresh.outputs.refresh_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Team
+        if: failure()
+        run: |
+          echo "❌ Rollback failed - manual intervention may be required"
+          # Add notification logic here (Slack, PagerDuty, etc.)
+          # Example:
+          # curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+          #   -d '{"text":"🚨 Rollback failed for ${{ steps.workspace.outputs.workspace }}"}'
+

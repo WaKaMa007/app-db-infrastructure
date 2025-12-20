@@ -121,6 +121,12 @@ variable "s3_bucket_name" {
   default     = "dev-web-app"
 }
 
+variable "deletion_protection" {
+  description = "Enable deletion protection for RDS database (prevents accidental deletion)"
+  type        = bool
+  default     = true # null means use workspace-specific default
+}
+
 variable "force_delete_secret" {
   description = "Force delete the secret"
   type        = bool
@@ -131,7 +137,7 @@ variable "force_delete_secret" {
 variable "hosted_zone_name" {
   description = "Name of the hosted zone"
   type        = string
-  default     = "381492052417.realhandsonlabs.net"  # This is the hosted zone name for the domain
+  default     = "006207983642.realhandsonlabs.net"  # This is the hosted zone name for the domain
 }
 
 variable "db_username" {

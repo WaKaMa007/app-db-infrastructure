@@ -33,7 +33,7 @@ locals {
       max_size            = "5"
       desired_capacity    = "2"
       db_instance_type    = "db.t3.medium"
-      deletion_protection = true
+      deletion_protection = var.deletion_protection
     }
   }
 

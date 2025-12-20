@@ -86,7 +86,7 @@ jobs:
             -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
           terraform workspace select ${{ steps.workspace.outputs.workspace }}
           
-          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>/dev/null || echo "")
+          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
           ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
             --region ${{ env.AWS_REGION }} \
             --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
@@ -227,7 +227,7 @@ jobs:
 
       - name: Verify Rollback
         run: |
-          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>/dev/null || echo "")
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
           
           if [ -z "$ALB_URL" ]; then
             echo "⚠️  Could not get ALB URL, skipping verification"

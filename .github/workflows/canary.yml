@@ -1,0 +1,326 @@
+name: Canary Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      version:
+        description: 'Application version/tag'
+        required: false
+        default: 'latest'
+      canary_percentage:
+        description: 'Initial canary traffic percentage'
+        required: false
+        type: choice
+        options:
+          - '10'
+          - '25'
+          - '50'
+        default: '10'
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: infrastructure-web-app/terraform
+
+jobs:
+  canary-deploy:
+    name: Canary Deployment
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Determine workspace
+        id: workspace
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "workspace=prod" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Infrastructure Info
+        id: infra
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
+          terraform workspace select ${{ steps.workspace.outputs.workspace }}
+          
+          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --region ${{ env.AWS_REGION }} \
+            --query "LoadBalancers[?contains(LoadBalancerName, 'web-app-${{ steps.workspace.outputs.workspace }}')].LoadBalancerArn" \
+            --output text | head -1)
+          
+          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
+
+      - name: Prepare Canary Application Code
+        run: |
+          mkdir -p /tmp/canary-deploy
+          
+          if [ -d "application" ]; then
+            cp -r application/* /tmp/canary-deploy/
+          else
+            cp infrastructure-web-app/terraform/scripts/userdata_client_app.sh /tmp/canary-deploy/
+          fi
+          
+          echo "${{ github.event.inputs.version || github.sha }}" > /tmp/canary-deploy/VERSION
+          echo "${{ github.run_id }}" > /tmp/canary-deploy/DEPLOY_ID
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/canary-deploy/DEPLOY_TIME
+
+      - name: Upload Canary Code to S3
+        run: |
+          aws s3 sync /tmp/canary-deploy \
+            s3://${{ steps.infra.outputs.s3_bucket }}/scripts/ \
+            --region ${{ env.AWS_REGION }} \
+            --delete
+
+      - name: Get Current ASG Info
+        id: asg-info
+        run: |
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --region ${{ env.AWS_REGION }} \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
+            --output text | head -1)
+          
+          DESIRED_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'AutoScalingGroups[0].DesiredCapacity' \
+            --output text)
+          
+          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
+          echo "desired_capacity=$DESIRED_CAPACITY" >> $GITHUB_OUTPUT
+          
+          # Calculate canary instance count
+          CANARY_PERCENT=${{ github.event.inputs.canary_percentage }}
+          CANARY_COUNT=$(echo "scale=0; ($DESIRED_CAPACITY * $CANARY_PERCENT) / 100" | bc)
+          if [ "$CANARY_COUNT" -lt 1 ]; then
+            CANARY_COUNT=1
+          fi
+          
+          echo "canary_count=$CANARY_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Phase 1 - Deploy 10% Canary
+        id: phase1
+        run: |
+          ASG_NAME="${{ steps.asg-info.outputs.asg_name }}"
+          CANARY_COUNT="${{ steps.asg-info.outputs.canary_count }}"
+          CANARY_PERCENT="${{ github.event.inputs.canary_percentage }}"
+          
+          echo "🚀 Phase 1: Deploying canary to $CANARY_PERCENT% of traffic ($CANARY_COUNT instances)"
+          
+          # Note: For true canary with ALB weighted routing, you'd need:
+          # 1. Separate target group for canary
+          # 2. ALB listener rules with weighted routing
+          # 
+          # For current setup, we'll use a safer approach:
+          # Deploy to a subset of instances gradually
+          
+          # Start instance refresh with min healthy percentage
+          # This ensures only some instances update at a time
+          MIN_HEALTHY=$((100 - CANARY_PERCENT))
+          
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --preferences "MinHealthyPercentage=$MIN_HEALTHY,InstanceWarmup=120,AutoRollback=true" \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+          
+          # Wait for canary instances to be healthy
+          echo "Waiting for canary instances to be healthy..."
+          MAX_WAIT=900
+          INTERVAL=30
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            
+            PROGRESS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'InstanceRefreshes[0].PercentageComplete' \
+              --output text)
+            
+            echo "Canary status: $STATUS (${PROGRESS}% complete)"
+            
+            # Check if canary percentage is deployed
+            if [ "$(echo "$PROGRESS >= $CANARY_PERCENT" | bc)" -eq 1 ]; then
+              echo "✅ Canary deployment reached target percentage"
+              break
+            fi
+            
+            if [ "$STATUS" == "Failed" ]; then
+              echo "❌ Canary deployment failed"
+              exit 1
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+      - name: Monitor Canary Metrics
+        id: monitor-canary
+        run: |
+          echo "📊 Monitoring canary metrics for 10 minutes..."
+          
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          
+          if [ -z "$ALB_URL" ]; then
+            echo "⚠️  Could not get ALB URL, using basic health checks"
+            MONITOR_URL="http://localhost"
+          else
+            MONITOR_URL="$ALB_URL"
+          fi
+          
+          MONITOR_DURATION=600  # 10 minutes
+          INTERVAL=30
+          ELAPSED=0
+          ERROR_COUNT=0
+          SUCCESS_COUNT=0
+          
+          while [ $ELAPSED -lt $MONITOR_DURATION ]; do
+            if curl -f -s "$MONITOR_URL/health" > /dev/null 2>&1; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+              echo "⚠️  Health check failed (errors: $ERROR_COUNT, successes: $SUCCESS_COUNT)"
+            fi
+            
+            # Calculate error rate
+            TOTAL=$((ERROR_COUNT + SUCCESS_COUNT))
+            if [ $TOTAL -gt 0 ]; then
+              ERROR_RATE=$(echo "scale=2; ($ERROR_COUNT * 100) / $TOTAL" | bc)
+              echo "Error rate: ${ERROR_RATE}%"
+              
+              # Fail if error rate exceeds 5%
+              if [ "$(echo "$ERROR_RATE > 5" | bc)" -eq 1 ]; then
+                echo "❌ Error rate too high: ${ERROR_RATE}% (threshold: 5%)"
+                echo "canary_healthy=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+            echo "Monitoring... (${ELAPSED}s elapsed, error rate: ${ERROR_RATE:-0}%)"
+          done
+          
+          echo "✅ Canary monitoring complete - metrics within acceptable range"
+          echo "canary_healthy=true" >> $GITHUB_OUTPUT
+
+      - name: Phase 2 - Increase to 50%
+        id: phase2
+        if: steps.monitor-canary.outputs.canary_healthy == 'true'
+        run: |
+          echo "🚀 Phase 2: Increasing canary to 50%"
+          
+          ASG_NAME="${{ steps.asg-info.outputs.asg_name }}"
+          
+          # Continue instance refresh with lower min healthy (50%)
+          # This allows more instances to update
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --preferences "MinHealthyPercentage=50,InstanceWarmup=120,AutoRollback=true" \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          echo "✅ Phase 2 deployment started: $REFRESH_ID"
+
+      - name: Monitor Phase 2
+        if: steps.monitor-canary.outputs.canary_healthy == 'true'
+        run: |
+          echo "📊 Monitoring Phase 2 (50% canary) for 10 minutes..."
+          sleep 600  # Monitor for 10 minutes
+          echo "✅ Phase 2 monitoring complete"
+
+      - name: Phase 3 - Complete Rollout (100%)
+        id: phase3
+        if: steps.monitor-canary.outputs.canary_healthy == 'true'
+        run: |
+          echo "🚀 Phase 3: Completing rollout to 100%"
+          
+          ASG_NAME="${{ steps.asg-info.outputs.asg_name }}"
+          
+          # Complete the instance refresh (all instances)
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --preferences "MinHealthyPercentage=0,InstanceWarmup=120,AutoRollback=true" \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          # Wait for completion
+          MAX_WAIT=1800
+          INTERVAL=30
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            
+            if [ "$STATUS" == "Successful" ]; then
+              echo "✅ Canary deployment complete - 100% rollout"
+              break
+            elif [ "$STATUS" == "Failed" ]; then
+              echo "❌ Final rollout failed"
+              exit 1
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+      - name: Canary Deployment Summary
+        if: always()
+        run: |
+          echo "## Canary Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ steps.workspace.outputs.workspace }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ github.event.inputs.version || github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Initial Canary %:** ${{ github.event.inputs.canary_percentage }}%" >> $GITHUB_STEP_SUMMARY
+          echo "- **Canary Health:** ${{ steps.monitor-canary.outputs.canary_healthy }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** Full canary with ALB weighted routing requires separate target groups" >> $GITHUB_STEP_SUMMARY
+

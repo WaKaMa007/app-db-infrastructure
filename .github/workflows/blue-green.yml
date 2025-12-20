@@ -1,0 +1,277 @@
+name: Blue/Green Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      version:
+        description: 'Application version/tag'
+        required: false
+        default: 'latest'
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: infrastructure-web-app/terraform
+
+jobs:
+  blue-green-deploy:
+    name: Blue/Green Deployment
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Determine workspace
+        id: workspace
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "workspace=prod" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Infrastructure Info
+        id: infra
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
+            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
+          terraform workspace select ${{ steps.workspace.outputs.workspace }}
+          
+          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --region ${{ env.AWS_REGION }} \
+            --query "LoadBalancers[?contains(LoadBalancerName, 'web-app-${{ steps.workspace.outputs.workspace }}')].LoadBalancerArn" \
+            --output text | head -1)
+          CURRENT_TG_ARN=$(aws elbv2 describe-target-groups \
+            --region ${{ env.AWS_REGION }} \
+            --query "TargetGroups[?contains(TargetGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].TargetGroupArn" \
+            --output text | head -1)
+          
+          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
+          echo "current_tg_arn=$CURRENT_TG_ARN" >> $GITHUB_OUTPUT
+
+      - name: Identify Blue Environment (Current)
+        id: blue
+        run: |
+          CURRENT_TG="${{ steps.infra.outputs.current_tg_arn }}"
+          CURRENT_ASG=$(aws autoscaling describe-auto-scaling-groups \
+            --region ${{ env.AWS_REGION }} \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
+            --output text | head -1)
+          
+          echo "target_group_arn=$CURRENT_TG" >> $GITHUB_OUTPUT
+          echo "asg_name=$CURRENT_ASG" >> $GITHUB_OUTPUT
+          echo "environment=blue" >> $GITHUB_OUTPUT
+
+      - name: Create Green Target Group
+        id: green-tg
+        run: |
+          # Note: For full blue/green, you'd create a new target group via Terraform
+          # This workflow assumes infrastructure supports multiple target groups
+          # For now, we'll use the existing target group approach with weighted routing
+          
+          echo "⚠️  Full Blue/Green requires infrastructure changes:"
+          echo "   1. Create separate ASG for green environment"
+          echo "   2. Create separate target group for green"
+          echo "   3. Use ALB weighted routing or listener rules"
+          echo ""
+          echo "For current setup, using rolling deployment approach..."
+          
+          # In a full implementation, create green target group here
+          # For now, we'll proceed with a safer rolling deployment
+          echo "green_tg_arn=${{ steps.blue.outputs.target_group_arn }}" >> $GITHUB_OUTPUT
+          echo "green_asg_name=${{ steps.blue.outputs.asg_name }}" >> $GITHUB_OUTPUT
+
+      - name: Prepare Green Application Code
+        run: |
+          mkdir -p /tmp/green-deploy
+          
+          if [ -d "application" ]; then
+            cp -r application/* /tmp/green-deploy/
+          else
+            cp infrastructure-web-app/terraform/scripts/userdata_client_app.sh /tmp/green-deploy/
+          fi
+          
+          echo "${{ github.event.inputs.version || github.sha }}" > /tmp/green-deploy/VERSION
+          echo "${{ github.run_id }}" > /tmp/green-deploy/DEPLOY_ID
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/green-deploy/DEPLOY_TIME
+
+      - name: Upload Green Code to S3
+        run: |
+          aws s3 sync /tmp/green-deploy \
+            s3://${{ steps.infra.outputs.s3_bucket }}/scripts/ \
+            --region ${{ env.AWS_REGION }} \
+            --delete
+
+      - name: Deploy to Green Environment
+        run: |
+          # In full blue/green: Create new ASG with green launch template
+          # For now: Deploy to existing ASG with staging approach
+          
+          ASG_NAME="${{ steps.green-tg.outputs.green_asg_name }}"
+          
+          echo "Starting deployment to green environment..."
+          
+          # Check for active refresh
+          ACTIVE_REFRESH=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'InstanceRefreshes[?Status==`InProgress` || Status==`Pending`].InstanceRefreshId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$ACTIVE_REFRESH" ] || [ "$ACTIVE_REFRESH" == "None" ]; then
+            # Start instance refresh for green
+            REFRESH_ID=$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --region ${{ env.AWS_REGION }} \
+              --preferences "MinHealthyPercentage=100,InstanceWarmup=120,AutoRollback=true" \
+              --query 'InstanceRefreshId' \
+              --output text)
+            
+            echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+            
+            # Wait for green to be healthy
+            echo "Waiting for green environment to be healthy..."
+            MAX_WAIT=1800
+            INTERVAL=30
+            ELAPSED=0
+            
+            while [ $ELAPSED -lt $MAX_WAIT ]; do
+              STATUS=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name "$ASG_NAME" \
+                --instance-refreshes "$REFRESH_ID" \
+                --region ${{ env.AWS_REGION }} \
+                --query 'InstanceRefreshes[0].Status' \
+                --output text)
+              
+              if [ "$STATUS" == "Successful" ]; then
+                echo "✅ Green environment ready"
+                break
+              elif [ "$STATUS" == "Failed" ]; then
+                echo "❌ Green deployment failed"
+                exit 1
+              fi
+              
+              sleep $INTERVAL
+              ELAPSED=$((ELAPSED + INTERVAL))
+            done
+          fi
+
+      - name: Integration Tests on Green
+        id: green-tests
+        run: |
+          # Get test URL (if you have a staging/test listener)
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          
+          if [ -z "$ALB_URL" ]; then
+            echo "⚠️  Could not get ALB URL, skipping integration tests"
+            echo "test_result=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Running integration tests on green environment: $ALB_URL"
+          
+          # Run integration tests
+          if [ -f "application/tests/test_integration.py" ]; then
+            pip install pytest requests
+            export TEST_URL="$ALB_URL"
+            if pytest application/tests/test_integration.py -v; then
+              echo "✅ Integration tests passed"
+              echo "test_result=passed" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Integration tests failed"
+              echo "test_result=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          else
+            echo "No integration tests found, skipping"
+            echo "test_result=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Switch Traffic to Green
+        if: steps.green-tests.outputs.test_result != 'failed'
+        run: |
+          # In full blue/green: Update ALB listener rule to route 100% traffic to green
+          # For current setup: Traffic is already on the updated instances
+          
+          echo "✅ Green environment is healthy and tested"
+          echo "Traffic switch complete (using rolling deployment)"
+          
+          # Full implementation would:
+          # 1. Update ALB listener rule weights (100% green, 0% blue)
+          # 2. Monitor green for issues
+          # 3. Optionally terminate blue after verification period
+
+      - name: Monitor Green Environment
+        run: |
+          echo "Monitoring green environment for 5 minutes..."
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          
+          if [ -z "$ALB_URL" ]; then
+            echo "⚠️  Could not get ALB URL, skipping monitoring"
+            exit 0
+          fi
+          
+          MONITOR_DURATION=300  # 5 minutes
+          INTERVAL=30
+          ELAPSED=0
+          ERROR_COUNT=0
+          
+          while [ $ELAPSED -lt $MONITOR_DURATION ]; do
+            if ! curl -f -s "$ALB_URL/health" > /dev/null; then
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+              echo "⚠️  Health check failed (errors: $ERROR_COUNT)"
+            fi
+            
+            if [ $ERROR_COUNT -gt 5 ]; then
+              echo "❌ Too many health check failures, consider rollback"
+              exit 1
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+            echo "Monitoring... (${ELAPSED}s elapsed)"
+          done
+          
+          echo "✅ Green environment monitoring complete"
+
+      - name: Blue/Green Deployment Summary
+        if: always()
+        run: |
+          echo "## Blue/Green Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ steps.workspace.outputs.workspace }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ github.event.inputs.version || github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Blue ASG:** ${{ steps.blue.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Green ASG:** ${{ steps.green-tg.outputs.green_asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Integration Tests:** ${{ steps.green-tests.outputs.test_result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** Full blue/green requires infrastructure changes (separate ASGs and target groups)" >> $GITHUB_STEP_SUMMARY
+

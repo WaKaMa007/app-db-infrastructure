@@ -66,12 +66,15 @@ jobs:
             -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
             -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
           terraform workspace select ${{ steps.workspace.outputs.workspace }} || terraform workspace new ${{ steps.workspace.outputs.workspace }}
-          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>/dev/null || echo "")
-          echo "bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          # Get output, filtering out warnings and special characters
+          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
           if [ -z "$S3_BUCKET" ]; then
             echo "❌ Could not get S3 bucket name from Terraform outputs"
+            echo "   This might mean the workspace is empty or outputs don't exist yet."
+            echo "   If this is a new workspace, run 'terraform apply' first."
             exit 1
           fi
+          echo "bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
 
       - name: Prepare Application Code
         id: prepare-app
@@ -111,7 +114,7 @@ jobs:
         id: asg-name
         working-directory: ${{ env.TERRAFORM_DIR }}
         run: |
-          ASG_NAME=$(terraform output -raw instance_count 2>/dev/null | head -1 || echo "")
+          ASG_NAME=$(terraform output -raw instance_count 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
           # Try to get ASG name from AWS directly
           ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
             --region ${{ env.AWS_REGION }} \
@@ -197,8 +200,8 @@ jobs:
       - name: Health Check
         id: health-check
         run: |
-          # Get ALB URL from Terraform output
-          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>/dev/null || echo "")
+          # Get ALB URL from Terraform output, filtering out warnings
+          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
           
           if [ -z "$ALB_URL" ]; then
             echo "⚠️  Could not get ALB URL, skipping health check"

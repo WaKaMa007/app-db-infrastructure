@@ -181,10 +181,14 @@ jobs:
 
       - name: Get Terraform Outputs
         id: outputs
+        continue-on-error: true
         working-directory: ${{ env.TERRAFORM_DIR }}
         run: |
-          echo "alb_url=$(terraform output -raw alb_https_url 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-          echo "asg_name=$(terraform output -raw instance_count 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          # Get outputs if they exist, otherwise use empty string
+          ALB_URL=$(terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" || echo "")
+          ASG_NAME=$(terraform output -raw instance_count 2>&1 | grep -v "Warning" | grep -v "│" || echo "")
+          echo "alb_url=${ALB_URL}" >> $GITHUB_OUTPUT
+          echo "asg_name=${ASG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Notify Success
         if: success()

@@ -58,48 +58,40 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.13.5
-          terraform_wrapper: false
-
-      - name: Determine workspace
+      - name: Get workspace
         id: workspace
-        run: |
-          if [ "${{ github.event.inputs.environment }}" != "" ]; then
-            echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.workflow_run.head_branch }}" == "main" ]; then
-            echo "workspace=prod" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.workflow_run.head_branch }}" == "staging" ]; then
-            echo "workspace=staging" >> $GITHUB_OUTPUT
-          else
-            echo "workspace=dev" >> $GITHUB_OUTPUT
-          fi
+        uses: ./.github/actions/get-workspace
+        with:
+          environment: ${{ github.event.inputs.environment }}
 
-      - name: Get Infrastructure Info
-        id: infra
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
-            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
-          terraform workspace select ${{ steps.workspace.outputs.workspace }}
-          
-          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
-          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
-            --region ${{ env.AWS_REGION }} \
-            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
-            --output text | head -1)
-          
-          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
-          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
+      - name: Setup Terraform
+        uses: ./.github/actions/terraform-setup
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          state_bucket: ${{ secrets.TF_STATE_BUCKET }}
+          state_key: ${{ secrets.TF_STATE_KEY }}
+          state_region: ${{ secrets.TF_STATE_REGION }}
+          workspace: ${{ steps.workspace.outputs.workspace }}
+
+      - name: Get S3 bucket name
+        id: s3-bucket
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: s3_bucket_app_assets
+
+      - name: Get ASG name
+        id: asg-name
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: asg_name
 
       - name: List S3 Versions
         id: s3-versions
         if: github.event.inputs.rollback_type == 's3_version'
         run: |
-          S3_BUCKET="${{ steps.infra.outputs.s3_bucket }}"
+          S3_BUCKET="${{ steps.s3-bucket.outputs.value }}"
           S3_KEY="scripts/userdata_client_app.sh"
           
           echo "Listing versions for s3://$S3_BUCKET/$S3_KEY"
@@ -134,7 +126,7 @@ jobs:
           github.event.inputs.rollback_type == 's3_version' &&
           (steps.s3-versions.outputs.version_id != '' || github.event.inputs.s3_version_id != '')
         run: |
-          S3_BUCKET="${{ steps.infra.outputs.s3_bucket }}"
+          S3_BUCKET="${{ steps.s3-bucket.outputs.value }}"
           S3_KEY="scripts/userdata_client_app.sh"
           
           if [ "${{ github.event.inputs.s3_version_id }}" != "" ]; then
@@ -157,7 +149,7 @@ jobs:
       - name: Trigger Instance Refresh (Rollback)
         id: instance-refresh
         run: |
-          ASG_NAME="${{ steps.infra.outputs.asg_name }}"
+          ASG_NAME="${{ steps.asg-name.outputs.value }}"
           
           echo "🔄 Starting instance refresh to rollback deployment..."
           
@@ -192,7 +184,7 @@ jobs:
 
       - name: Wait for Rollback Completion
         run: |
-          ASG_NAME="${{ steps.infra.outputs.asg_name }}"
+          ASG_NAME="${{ steps.asg-name.outputs.value }}"
           REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
           MAX_WAIT=1800
           INTERVAL=30
@@ -225,15 +217,17 @@ jobs:
           echo "⚠️  Rollback timeout after ${MAX_WAIT}s"
           exit 1
 
+      - name: Get ALB URL
+        id: alb-url
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: alb_https_url
+
       - name: Verify Rollback
+        id: verify-rollback
         run: |
-          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
-          
-          if [ -z "$ALB_URL" ]; then
-            echo "⚠️  Could not get ALB URL, skipping verification"
-            exit 0
-          fi
-          
+          ALB_URL="${{ steps.alb-url.outputs.value }}"
           echo "Verifying rollback health..."
           
           MAX_RETRIES=10
@@ -261,7 +255,7 @@ jobs:
           if [ "${{ github.event.inputs.rollback_type }}" == "s3_version" ]; then
             echo "- **S3 Version:** ${{ steps.s3-versions.outputs.version_id || github.event.inputs.s3_version_id }}" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "- **ASG:** ${{ steps.infra.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ASG:** ${{ steps.asg-name.outputs.value }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Instance Refresh:** ${{ steps.instance-refresh.outputs.refresh_id }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
 

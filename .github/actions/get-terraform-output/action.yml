@@ -1,0 +1,41 @@
+name: 'Get Terraform Output'
+description: 'Gets a Terraform output value using terraform output -raw (no parsing)'
+inputs:
+  terraform_dir:
+    description: 'Path to Terraform directory'
+    required: false
+    default: 'infrastructure-web-app/terraform'
+  output_name:
+    description: 'Name of the Terraform output to retrieve'
+    required: true
+
+outputs:
+  value:
+    description: 'The output value'
+    value: ${{ steps.output.outputs.value }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Get output
+      id: output
+      shell: bash
+      working-directory: ${{ inputs.terraform_dir }}
+      run: |
+        # Use terraform output -raw for clean output (no quotes, no formatting)
+        VALUE=$(terraform output -raw "${{ inputs.output_name }}" 2>&1)
+        
+        # Check if terraform output command failed
+        if [ $? -ne 0 ]; then
+          echo "❌ Failed to get output: ${{ inputs.output_name }}"
+          echo "Error: $VALUE"
+          exit 1
+        fi
+        
+        # Use GitHub's built-in output (handles multiline values correctly)
+        echo "value<<EOF" >> $GITHUB_OUTPUT
+        echo "$VALUE" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "✅ Output ${{ inputs.output_name }}: $(echo "$VALUE" | head -c 50)..."
+

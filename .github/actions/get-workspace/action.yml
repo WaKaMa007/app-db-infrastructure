@@ -1,0 +1,49 @@
+name: 'Get Terraform Workspace'
+description: 'Determines Terraform workspace from branch or input'
+inputs:
+  environment:
+    description: 'Explicit environment name (dev, staging, or prod)'
+    required: false
+outputs:
+  workspace:
+    description: 'Terraform workspace name (dev, staging, or prod)'
+    value: ${{ steps.workspace.outputs.workspace }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine workspace
+      id: workspace
+      shell: bash
+      run: |
+        # Priority: explicit input > workflow_run branch > current branch
+        if [ -n "${{ inputs.environment }}" ]; then
+          WORKSPACE="${{ inputs.environment }}"
+        elif [ -n "${{ github.event.workflow_run.head_branch }}" ]; then
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+        else
+          BRANCH="${{ github.ref_name }}"
+        fi
+        
+        # Map branch to workspace
+        if [ "$WORKSPACE" = "" ]; then
+          case "$BRANCH" in
+            master|main)
+              WORKSPACE="prod"
+              ;;
+            staging)
+              WORKSPACE="staging"
+              ;;
+            dev|develop|development)
+              WORKSPACE="dev"
+              ;;
+            *)
+              # Default to dev for unknown branches
+              WORKSPACE="dev"
+              ;;
+          esac
+        fi
+        
+        echo "workspace=$WORKSPACE" >> $GITHUB_OUTPUT
+        echo "✅ Workspace: $WORKSPACE"
+

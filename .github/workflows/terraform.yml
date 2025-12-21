@@ -34,23 +34,21 @@ jobs:
     name: Determine Environment
     runs-on: ubuntu-latest
     outputs:
-      workspace: ${{ steps.set-env.outputs.workspace }}
-      action: ${{ steps.set-env.outputs.action }}
+      workspace: ${{ steps.workspace.outputs.workspace }}
+      action: ${{ steps.set-action.outputs.action }}
     steps:
-      - name: Set environment
-        id: set-env
+      - name: Get workspace
+        id: workspace
+        uses: ./.github/actions/get-workspace
+        with:
+          environment: ${{ github.event.inputs.environment }}
+
+      - name: Set action
+        id: set-action
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
             echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.ref }}" == "refs/heads/master" ]; then
-            echo "workspace=prod" >> $GITHUB_OUTPUT
-            echo "action=apply" >> $GITHUB_OUTPUT
-          elif [ "${{ github.ref }}" == "refs/heads/staging" ]; then
-            echo "workspace=staging" >> $GITHUB_OUTPUT
-            echo "action=apply" >> $GITHUB_OUTPUT
           else
-            echo "workspace=dev" >> $GITHUB_OUTPUT
             echo "action=apply" >> $GITHUB_OUTPUT
           fi
 
@@ -82,19 +80,14 @@ jobs:
           terraform_version: 1.13.5
           terraform_wrapper: false
 
-      - name: Terraform Init
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
-            -backend-config="region=${{ secrets.TF_STATE_REGION }}"
-
-      - name: Select Terraform workspace
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          terraform workspace select ${{ needs.determine-environment.outputs.workspace }} || \
-          terraform workspace new ${{ needs.determine-environment.outputs.workspace }}
+      - name: Setup Terraform
+        uses: ./.github/actions/terraform-setup
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          state_bucket: ${{ secrets.TF_STATE_BUCKET }}
+          state_key: ${{ secrets.TF_STATE_KEY }}
+          state_region: ${{ secrets.TF_STATE_REGION }}
+          workspace: ${{ needs.determine-environment.outputs.workspace }}
 
       - name: Terraform Plan
         id: plan
@@ -174,9 +167,6 @@ jobs:
             -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
             -backend-config="region=${{ secrets.TF_STATE_REGION }}"
 
-      - name: Select Terraform workspace
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: terraform workspace select ${{ needs.determine-environment.outputs.workspace }}
 
       - name: Terraform Apply
         working-directory: ${{ env.TERRAFORM_DIR }}
@@ -235,9 +225,6 @@ jobs:
             -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
             -backend-config="region=${{ secrets.TF_STATE_REGION }}"
 
-      - name: Select Terraform workspace
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: terraform workspace select ${{ needs.determine-environment.outputs.workspace }}
 
       - name: Terraform Destroy
         working-directory: ${{ env.TERRAFORM_DIR }}

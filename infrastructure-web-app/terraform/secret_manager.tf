@@ -10,7 +10,7 @@ resource "aws_secretsmanager_secret" "db_credentials" {
   # Without this, secrets are scheduled for deletion with a 7-30 day recovery window
   # Setting to 0 ensures the secret is permanently deleted immediately
   recovery_window_in_days = var.force_delete_secret ? 0 : 7
-  
+
 
   tags = {
     Name        = "${local.name_prefix}-db-credentials"

@@ -38,75 +38,72 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.13.5
-          terraform_wrapper: false
-
-      - name: Determine workspace
+      - name: Get workspace
         id: workspace
-        run: |
-          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
-            echo "workspace=prod" >> $GITHUB_OUTPUT
-          else
-            echo "workspace=staging" >> $GITHUB_OUTPUT
-          fi
+        uses: ./.github/actions/get-workspace
+        with:
+          environment: ${{ github.event.inputs.environment }}
 
-      - name: Get Infrastructure Info
-        id: infra
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
-            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false
-          terraform workspace select ${{ steps.workspace.outputs.workspace }}
-          
-          S3_BUCKET=$(terraform output -raw s3_bucket_app_assets 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
-          ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --region ${{ env.AWS_REGION }} \
-            --query "LoadBalancers[?contains(LoadBalancerName, 'web-app-${{ steps.workspace.outputs.workspace }}')].LoadBalancerArn" \
-            --output text | head -1)
-          CURRENT_TG_ARN=$(aws elbv2 describe-target-groups \
-            --region ${{ env.AWS_REGION }} \
-            --query "TargetGroups[?contains(TargetGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].TargetGroupArn" \
-            --output text | head -1)
-          
-          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
-          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
-          echo "current_tg_arn=$CURRENT_TG_ARN" >> $GITHUB_OUTPUT
+      - name: Setup Terraform
+        uses: ./.github/actions/terraform-setup
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          state_bucket: ${{ secrets.TF_STATE_BUCKET }}
+          state_key: ${{ secrets.TF_STATE_KEY }}
+          state_region: ${{ secrets.TF_STATE_REGION }}
+          workspace: ${{ steps.workspace.outputs.workspace }}
 
-      - name: Identify Blue Environment (Current)
-        id: blue
-        run: |
-          CURRENT_TG="${{ steps.infra.outputs.current_tg_arn }}"
-          CURRENT_ASG=$(aws autoscaling describe-auto-scaling-groups \
-            --region ${{ env.AWS_REGION }} \
-            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
-            --output text | head -1)
-          
-          echo "target_group_arn=$CURRENT_TG" >> $GITHUB_OUTPUT
-          echo "asg_name=$CURRENT_ASG" >> $GITHUB_OUTPUT
-          echo "environment=blue" >> $GITHUB_OUTPUT
+      - name: Get target group ARN
+        id: target-group
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: target_group_arn
 
-      - name: Create Green Target Group
-        id: green-tg
+      - name: Get ASG name (Blue)
+        id: asg-name
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: asg_name
+
+      - name: Get ALB ARN
+        id: alb-arn
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: alb_arn
+
+      - name: Get S3 bucket name
+        id: s3-bucket
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: s3_bucket_app_assets
+
+      - name: Identify Blue Environment (Current Production)
+        id: blue-info
         run: |
-          # Note: For full blue/green, you'd create a new target group via Terraform
-          # This workflow assumes infrastructure supports multiple target groups
-          # For now, we'll use the existing target group approach with weighted routing
+          # NOTE: This is NOT a true blue/green deployment.
+          # Current infrastructure doesn't support separate blue/green environments.
+          # This workflow performs a safer rolling deployment with testing.
+          #
+          # For true blue/green, you would need:
+          # 1. Separate ASG for green environment (created via Terraform)
+          # 2. Separate target group for green (created via Terraform)
+          # 3. ALB listener rules with weighted routing
+          # 4. Traffic shifting logic (0% → 10% → 50% → 100%)
+          # 5. Rollback path (switch back to blue if green fails)
+          #
+          # Until infrastructure supports this, we use rolling deployment.
           
-          echo "⚠️  Full Blue/Green requires infrastructure changes:"
-          echo "   1. Create separate ASG for green environment"
-          echo "   2. Create separate target group for green"
-          echo "   3. Use ALB weighted routing or listener rules"
-          echo ""
-          echo "For current setup, using rolling deployment approach..."
+          echo "target_group_arn=${{ steps.target-group.outputs.value }}" >> $GITHUB_OUTPUT
+          echo "asg_name=${{ steps.asg-name.outputs.value }}" >> $GITHUB_OUTPUT
           
-          # In a full implementation, create green target group here
-          # For now, we'll proceed with a safer rolling deployment
-          echo "green_tg_arn=${{ steps.blue.outputs.target_group_arn }}" >> $GITHUB_OUTPUT
-          echo "green_asg_name=${{ steps.blue.outputs.asg_name }}" >> $GITHUB_OUTPUT
+          # In true blue/green, green would use different ASG/TG
+          # For now, same ASG (rolling update)
+          echo "green_asg_name=${{ steps.asg-name.outputs.value }}" >> $GITHUB_OUTPUT
+          echo "green_tg_arn=${{ steps.target-group.outputs.value }}" >> $GITHUB_OUTPUT
 
       - name: Prepare Green Application Code
         run: |
@@ -125,16 +122,15 @@ jobs:
       - name: Upload Green Code to S3
         run: |
           aws s3 sync /tmp/green-deploy \
-            s3://${{ steps.infra.outputs.s3_bucket }}/scripts/ \
+            s3://${{ steps.s3-bucket.outputs.value }}/scripts/ \
             --region ${{ env.AWS_REGION }} \
             --delete
 
       - name: Deploy to Green Environment
         run: |
-          # In full blue/green: Create new ASG with green launch template
-          # For now: Deploy to existing ASG with staging approach
-          
-          ASG_NAME="${{ steps.green-tg.outputs.green_asg_name }}"
+          # NOTE: This is a rolling deployment, not true blue/green
+          # In true blue/green: Create new ASG with green launch template
+          ASG_NAME="${{ steps.blue-info.outputs.green_asg_name }}"
           
           echo "Starting deployment to green environment..."
           
@@ -183,11 +179,17 @@ jobs:
             done
           fi
 
+      - name: Get ALB URL
+        id: alb-url
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: alb_https_url
+
       - name: Integration Tests on Green
         id: green-tests
         run: |
-          # Get test URL (if you have a staging/test listener)
-          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          ALB_URL="${{ steps.alb-url.outputs.value }}"
           
           if [ -z "$ALB_URL" ]; then
             echo "⚠️  Could not get ALB URL, skipping integration tests"
@@ -231,7 +233,7 @@ jobs:
       - name: Monitor Green Environment
         run: |
           echo "Monitoring green environment for 5 minutes..."
-          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
+          ALB_URL="${{ steps.alb-url.outputs.value }}"
           
           if [ -z "$ALB_URL" ]; then
             echo "⚠️  Could not get ALB URL, skipping monitoring"
@@ -268,10 +270,16 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Environment:** ${{ steps.workspace.outputs.workspace }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Version:** ${{ github.event.inputs.version || github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Blue ASG:** ${{ steps.blue.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Green ASG:** ${{ steps.green-tg.outputs.green_asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ASG:** ${{ steps.blue-info.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Note:** This is a rolling deployment, not true blue/green" >> $GITHUB_STEP_SUMMARY
           echo "- **Integration Tests:** ${{ steps.green-tests.outputs.test_result }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Note:** Full blue/green requires infrastructure changes (separate ASGs and target groups)" >> $GITHUB_STEP_SUMMARY
+          echo "**⚠️  WARNING:** This workflow performs a rolling deployment, NOT true blue/green." >> $GITHUB_STEP_SUMMARY
+          echo "For true blue/green deployment, infrastructure changes are required:" >> $GITHUB_STEP_SUMMARY
+          echo "- Separate ASG for green environment" >> $GITHUB_STEP_SUMMARY
+          echo "- Separate target group for green" >> $GITHUB_STEP_SUMMARY
+          echo "- ALB listener rules with weighted routing" >> $GITHUB_STEP_SUMMARY
+          echo "- Traffic shifting logic (gradual 0% → 100%)" >> $GITHUB_STEP_SUMMARY
+          echo "- Rollback path (switch back to blue if green fails)" >> $GITHUB_STEP_SUMMARY
 

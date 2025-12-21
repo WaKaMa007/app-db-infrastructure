@@ -51,133 +51,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Determine workspace
+      - name: Get workspace
         id: workspace
-        run: |
-          # Determine environment from input or triggering workflow branch
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.environment }}" ]; then
-            echo "workspace=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" == "workflow_run" ]; then
-            TRIGGER_BRANCH="${{ github.event.workflow_run.head_branch }}"
-            if [ "$TRIGGER_BRANCH" == "master" ]; then
-              echo "workspace=prod" >> $GITHUB_OUTPUT
-            elif [ "$TRIGGER_BRANCH" == "staging" ]; then
-              echo "workspace=staging" >> $GITHUB_OUTPUT
-            else
-              echo "workspace=dev" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "workspace=dev" >> $GITHUB_OUTPUT
-          fi
+        uses: ./.github/actions/get-workspace
+        with:
+          environment: ${{ github.event.inputs.environment }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: ./.github/actions/terraform-setup
         with:
-          terraform_version: 1.13.5
-          terraform_wrapper: false
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          state_bucket: ${{ secrets.TF_STATE_BUCKET }}
+          state_key: ${{ secrets.TF_STATE_KEY }}
+          state_region: ${{ secrets.TF_STATE_REGION }}
+          workspace: ${{ steps.workspace.outputs.workspace }}
 
-      - name: Get S3 Bucket Name
+      - name: Get S3 bucket name
         id: s3-bucket
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ secrets.TF_STATE_KEY }}" \
-            -backend-config="region=${{ secrets.TF_STATE_REGION }}" -input=false || {
-            echo "❌ Terraform init failed"
-            exit 1
-          }
-          
-          # Select or create workspace
-          terraform workspace select ${{ steps.workspace.outputs.workspace }} 2>/dev/null || \
-          terraform workspace new ${{ steps.workspace.outputs.workspace }} || {
-            echo "❌ Failed to select or create workspace: ${{ steps.workspace.outputs.workspace }}"
-            exit 1
-          }
-          
-          echo "✅ Using workspace: $(terraform workspace show)"
-          
-          # Check if state can be loaded first (this validates state format)
-          echo "📋 Validating Terraform state..."
-          if ! terraform state list >/dev/null 2>&1; then
-            STATE_ERROR=$(terraform state list 2>&1)
-            echo "❌ Failed to load Terraform state"
-            echo ""
-            echo "Error details:"
-            echo "$STATE_ERROR"
-            echo ""
-            if echo "$STATE_ERROR" | grep -q "unsupported checkable object kind"; then
-              echo "⚠️  State format error detected - this usually means:"
-              echo "   1. Terraform version mismatch (local vs CI)"
-              echo "   2. State file format incompatibility"
-              echo "   3. Corrupted state file"
-              echo ""
-              echo "Solutions:"
-              echo "- Verify Terraform version matches (CI uses 1.5.0)"
-              echo "- Check state file in S3: s3://${{ secrets.TF_STATE_BUCKET }}/${{ secrets.TF_STATE_KEY }}"
-              echo "- Try running 'terraform state list' locally to verify state is accessible"
-            fi
-            exit 1
-          fi
-          
-          # Check if workspace has any resources
-          STATE_LIST=$(terraform state list 2>&1)
-          STATE_COUNT=$(echo "$STATE_LIST" | grep -v "^$" | grep -v "Warning" | wc -l || echo "0")
-          if [ "$STATE_COUNT" -eq 0 ]; then
-            echo "⚠️  Workspace '${{ steps.workspace.outputs.workspace }}' appears to be empty"
-            echo "   This workspace has no resources in state."
-            echo "   You need to run 'terraform apply' in this workspace first."
-            exit 1
-          fi
-          
-          echo "✅ State loaded successfully ($STATE_COUNT resources found)"
-          
-          # Try to get output (with better error handling)
-          echo "📋 Checking for output 's3_bucket_app_assets'..."
-          OUTPUT_CHECK=$(terraform output s3_bucket_app_assets 2>&1)
-          if echo "$OUTPUT_CHECK" | grep -q "Failed to load state\|Error:"; then
-            echo "❌ Error while checking outputs:"
-            echo "$OUTPUT_CHECK"
-            exit 1
-          elif echo "$OUTPUT_CHECK" | grep -q "No output found\|No outputs"; then
-            echo "❌ Output 's3_bucket_app_assets' does not exist in workspace"
-            echo ""
-            echo "Available outputs:"
-            terraform output 2>&1 | head -20 || echo "No outputs available"
-            echo ""
-            echo "This means the infrastructure output hasn't been created yet."
-            echo "You need to run 'terraform apply' in the '${{ steps.workspace.outputs.workspace }}' workspace first."
-            exit 1
-          fi
-          
-          # Get output using -raw flag (simplest and most reliable)
-          echo "📋 Retrieving S3 bucket name from Terraform output..."
-          S3_BUCKET_RAW=$(terraform output -raw s3_bucket_app_assets 2>&1)
-          
-          # Clean the raw output - remove quotes, whitespace, and formatting characters
-          S3_BUCKET=$(echo "$S3_BUCKET_RAW" | \
-            sed 's/[╷╵│─┐┘┌└├┤┬┴┼]//g' | \
-            sed 's/^[[:space:]]*"*//' | \
-            sed 's/"*[[:space:]]*$//' | \
-            sed 's/^[[:space:]]*//' | \
-            sed 's/[[:space:]]*$//' | \
-            grep -v "Warning" | \
-            grep -v "Error" | \
-            grep -v "No outputs found" | \
-            grep -v "^$" | \
-            head -1)
-          
-          # Verify we got a valid bucket name
-          if [ -z "$S3_BUCKET" ] || [ "${#S3_BUCKET}" -lt 3 ]; then
-            echo "❌ Could not extract valid S3 bucket name"
-            echo "   Extracted value: '$S3_BUCKET'"
-            echo ""
-            echo "   Trying to list all outputs for debugging:"
-            terraform output 2>&1
-            exit 1
-          fi
-          
-          echo "✅ S3 Bucket Name: $S3_BUCKET"
-          echo "bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: s3_bucket_app_assets
 
       - name: Prepare Application Code
         id: prepare-app
@@ -207,34 +101,23 @@ jobs:
 
       - name: Upload to S3
         run: |
-          echo "Uploading application to S3 bucket: ${{ steps.s3-bucket.outputs.bucket }}"
+          echo "Uploading application to S3 bucket: ${{ steps.s3-bucket.outputs.value }}"
           aws s3 sync ${{ steps.prepare-app.outputs.deploy_path }} \
-            s3://${{ steps.s3-bucket.outputs.bucket }}/scripts/ \
+            s3://${{ steps.s3-bucket.outputs.value }}/scripts/ \
             --region ${{ env.AWS_REGION }} \
             --delete
 
-      - name: Get ASG Name
+      - name: Get ASG name
         id: asg-name
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          ASG_NAME=$(terraform output -raw instance_count 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
-          # Try to get ASG name from AWS directly
-          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
-            --region ${{ env.AWS_REGION }} \
-            --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'web-app-${{ steps.workspace.outputs.workspace }}')].AutoScalingGroupName" \
-            --output text | head -1)
-          
-          if [ -z "$ASG_NAME" ]; then
-            echo "❌ Could not find ASG name"
-            exit 1
-          fi
-          
-          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: asg_name
 
       - name: Trigger Instance Refresh
         id: instance-refresh
         run: |
-          ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
+          ASG_NAME="${{ steps.asg-name.outputs.value }}"
           REGION="${{ env.AWS_REGION }}"
           
           echo "Starting instance refresh for ASG: $ASG_NAME"
@@ -269,7 +152,7 @@ jobs:
       - name: Instance Refresh Info (Non-blocking)
         if: github.event.inputs.wait_for_refresh != 'true' || github.event_name == 'workflow_run'
         run: |
-          ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
+          ASG_NAME="${{ steps.asg-name.outputs.value }}"
           REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
           REGION="${{ env.AWS_REGION }}"
           
@@ -292,7 +175,7 @@ jobs:
       - name: Wait for Instance Refresh (Blocking)
         if: github.event.inputs.wait_for_refresh == 'true' && github.event_name == 'workflow_dispatch'
         run: |
-          ASG_NAME="${{ steps.asg-name.outputs.asg_name }}"
+          ASG_NAME="${{ steps.asg-name.outputs.value }}"
           REFRESH_ID="${{ steps.instance-refresh.outputs.refresh_id }}"
           REGION="${{ env.AWS_REGION }}"
           MAX_WAIT=3600  # 60 minutes (increased for large deployments)
@@ -352,16 +235,17 @@ jobs:
             exit 0
           fi
 
+      - name: Get ALB URL
+        id: alb-url
+        uses: ./.github/actions/get-terraform-output
+        with:
+          terraform_dir: ${{ env.TERRAFORM_DIR }}
+          output_name: alb_https_url
+
       - name: Health Check
         id: health-check
         run: |
-          # Get ALB URL from Terraform output, filtering out warnings
-          ALB_URL=$(cd ${{ env.TERRAFORM_DIR }} && terraform output -raw alb_https_url 2>&1 | grep -v "Warning" | grep -v "│" | grep -v "No outputs found" | head -1 || echo "")
-          
-          if [ -z "$ALB_URL" ]; then
-            echo "⚠️  Could not get ALB URL, skipping health check"
-            exit 0
-          fi
+          ALB_URL="${{ steps.alb-url.outputs.value }}"
           
           echo "Performing health check on: $ALB_URL"
           
@@ -387,8 +271,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Environment:** ${{ steps.workspace.outputs.workspace }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Version:** ${{ github.event.inputs.version || github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **S3 Bucket:** ${{ steps.s3-bucket.outputs.bucket }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **ASG:** ${{ steps.asg-name.outputs.asg_name }}" >> $GITHUB_STEP_SUMMARY
+                echo "- **S3 Bucket:** ${{ steps.s3-bucket.outputs.value }}" >> $GITHUB_STEP_SUMMARY
+                echo "- **ASG:** ${{ steps.asg-name.outputs.value }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Instance Refresh:** ${{ steps.instance-refresh.outputs.refresh_id }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
 

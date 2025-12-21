@@ -134,7 +134,28 @@ output "access_instructions" {
         --parameters '{"host":["${try(aws_instance.prometheus.private_ip, "")}"],"portNumber":["9090"],"localPortNumber":["9090"]}'
       Then open: http://localhost:9090
   EOT
-} 
+}
+
+# Infrastructure resource identifiers for CI/CD workflows
+output "asg_name" {
+  description = "Auto Scaling Group name"
+  value       = aws_autoscaling_group.app-server-asg.name
+}
+
+output "target_group_arn" {
+  description = "Application target group ARN"
+  value       = aws_lb_target_group.app-server-tg.arn
+}
+
+output "alb_arn" {
+  description = "Application Load Balancer ARN"
+  value       = aws_lb.app-server-lb.arn
+}
+
+output "alb_dns_name" {
+  description = "Application Load Balancer DNS name"
+  value       = aws_lb.app-server-lb.dns_name
+}
 
 
 

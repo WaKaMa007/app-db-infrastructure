@@ -23,12 +23,26 @@ runs:
       working-directory: ${{ inputs.terraform_dir }}
       run: |
         # Use terraform output -raw for clean output (no quotes, no formatting)
+        # Capture both stdout and stderr separately
         VALUE=$(terraform output -raw "${{ inputs.output_name }}" 2>&1)
+        EXIT_CODE=$?
         
         # Check if terraform output command failed
-        if [ $? -ne 0 ]; then
+        if [ $EXIT_CODE -ne 0 ]; then
           echo "❌ Failed to get output: ${{ inputs.output_name }}"
-          echo "Error: $VALUE"
+          echo ""
+          echo "Exit code: $EXIT_CODE"
+          echo "Error output:"
+          echo "$VALUE"
+          echo ""
+          echo "Debugging info:"
+          echo "- Terraform directory: ${{ inputs.terraform_dir }}"
+          echo "- Output name: ${{ inputs.output_name }}"
+          echo "- Terraform version: $(terraform version 2>&1 | head -1 || echo 'terraform not found')"
+          echo "- Current workspace: $(terraform workspace show 2>&1 || echo 'workspace show failed')"
+          echo ""
+          echo "Available outputs:"
+          terraform output 2>&1 || echo "Failed to list outputs"
           exit 1
         fi
         
